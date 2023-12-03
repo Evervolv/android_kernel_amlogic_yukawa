@@ -17,26 +17,27 @@ static void __kvm_flush_dcache_to_poc(void *addr, size_t size)
 	kvm_flush_dcache_to_poc((unsigned long)addr, (unsigned long)size);
 }
 
-DEFINE_HYP_SPINLOCK(modules_lock);
-
-bool __pkvm_modules_enabled __ro_after_init;
-
-void pkvm_modules_lock(void)
+static void __update_hcr_el2(unsigned long set_mask, unsigned long clear_mask)
 {
-	hyp_spin_lock(&modules_lock);
+	struct kvm_nvhe_init_params *params = this_cpu_ptr(&kvm_init_params);
+
+	params->hcr_el2 |= set_mask;
+	params->hcr_el2 &= ~clear_mask;
+	__kvm_flush_dcache_to_poc(params, sizeof(*params));
+	write_sysreg(params->hcr_el2, hcr_el2);
 }
 
-void pkvm_modules_unlock(void)
+static void __update_hfgwtr_el2(unsigned long set_mask, unsigned long clear_mask)
 {
-	hyp_spin_unlock(&modules_lock);
+	struct kvm_nvhe_init_params *params = this_cpu_ptr(&kvm_init_params);
+
+	params->hfgwtr_el2 |= set_mask;
+	params->hfgwtr_el2 &= ~clear_mask;
+	__kvm_flush_dcache_to_poc(params, sizeof(*params));
+	write_sysreg_s(params->hfgwtr_el2, SYS_HFGWTR_EL2);
 }
 
-bool pkvm_modules_enabled(void)
-{
-	return __pkvm_modules_enabled;
-}
-
-static u64 early_lm_pages;
+static atomic_t early_lm_pages;
 static void *__pkvm_linear_map_early(phys_addr_t phys, size_t size, enum kvm_pgtable_prot prot)
 {
 	void *addr = NULL;
@@ -45,56 +46,46 @@ static void *__pkvm_linear_map_early(phys_addr_t phys, size_t size, enum kvm_pgt
 	if (!PAGE_ALIGNED(phys) || !PAGE_ALIGNED(size))
 		return NULL;
 
-	pkvm_modules_lock();
-	if (!__pkvm_modules_enabled)
-		goto out;
-
 	addr = __hyp_va(phys);
 	ret = pkvm_create_mappings(addr, addr + size, prot);
 	if (ret)
 		addr = NULL;
 	else
-		early_lm_pages += size >> PAGE_SHIFT;
-out:
-	pkvm_modules_unlock();
+		atomic_add(size, &early_lm_pages);
 
 	return addr;
 }
 
 static void __pkvm_linear_unmap_early(void *addr, size_t size)
 {
-	pkvm_modules_lock();
 	pkvm_remove_mappings(addr, addr + size);
-	early_lm_pages -= size >> PAGE_SHIFT;
-	pkvm_modules_unlock();
+	atomic_sub(size, &early_lm_pages);
 }
 
-int __pkvm_close_module_registration(void)
+void __pkvm_close_module_registration(void)
 {
-	int ret;
-
-	pkvm_modules_lock();
 	/*
 	 * Page ownership tracking might go out of sync if there are stale
 	 * entries in pKVM's linear map range, so they must really be gone by
 	 * now.
 	 */
-	WARN_ON(early_lm_pages);
+	WARN_ON_ONCE(atomic_read(&early_lm_pages));
 
-	ret = __pkvm_modules_enabled ? 0 : -EACCES;
-	if (!ret) {
-		void *addr = hyp_fixmap_map(__hyp_pa(&__pkvm_modules_enabled));
-		*(bool *)addr = false;
-		hyp_fixmap_unmap();
-	}
-	pkvm_modules_unlock();
+	/*
+	 * Nothing else to do, module loading HVCs are only accessible before
+	 * deprivilege
+	 */
+}
 
-	/* The fuse is blown! No way back until reset */
-	return ret;
+static int __pkvm_module_host_donate_hyp(u64 pfn, u64 nr_pages)
+{
+	return ___pkvm_host_donate_hyp(pfn, nr_pages, true);
 }
 
 const struct pkvm_module_ops module_ops = {
 	.create_private_mapping = __pkvm_create_private_mapping,
+	.alloc_module_va = __pkvm_alloc_module_va,
+	.map_module_page = __pkvm_map_module_page,
 	.register_serial_driver = __pkvm_register_serial_driver,
 	.puts = hyp_puts,
 	.putx64 = hyp_putx64,
@@ -103,30 +94,34 @@ const struct pkvm_module_ops module_ops = {
 	.linear_map_early = __pkvm_linear_map_early,
 	.linear_unmap_early = __pkvm_linear_unmap_early,
 	.flush_dcache_to_poc = __kvm_flush_dcache_to_poc,
+	.update_hcr_el2 = __update_hcr_el2,
+	.update_hfgwtr_el2 = __update_hfgwtr_el2,
 	.register_host_perm_fault_handler = hyp_register_host_perm_fault_handler,
-	.protect_host_page = hyp_protect_host_page,
+	.host_stage2_mod_prot = module_change_host_page_prot,
+	.host_stage2_get_leaf = host_stage2_get_leaf,
 	.register_host_smc_handler = __pkvm_register_host_smc_handler,
 	.register_default_trap_handler = __pkvm_register_default_trap_handler,
 	.register_illegal_abt_notifier = __pkvm_register_illegal_abt_notifier,
 	.register_psci_notifier = __pkvm_register_psci_notifier,
 	.register_hyp_panic_notifier = __pkvm_register_hyp_panic_notifier,
+	.host_donate_hyp = __pkvm_module_host_donate_hyp,
+	.hyp_donate_host = __pkvm_hyp_donate_host,
+	.host_share_hyp = __pkvm_host_share_hyp,
+	.host_unshare_hyp = __pkvm_host_unshare_hyp,
+	.pin_shared_mem = hyp_pin_shared_mem,
+	.unpin_shared_mem = hyp_unpin_shared_mem,
+	.memcpy = memcpy,
+	.memset = memset,
+	.hyp_pa = hyp_virt_to_phys,
+	.hyp_va = hyp_phys_to_virt,
+	.kern_hyp_va = __kern_hyp_va,
 };
 
 int __pkvm_init_module(void *module_init)
 {
 	int (*do_module_init)(const struct pkvm_module_ops *ops) = module_init;
-	int ret;
 
-	pkvm_modules_lock();
-	if (!pkvm_modules_enabled()) {
-		ret = -EACCES;
-		goto err;
-	}
-	ret = do_module_init(&module_ops);
-err:
-	pkvm_modules_unlock();
-
-	return ret;
+	return do_module_init(&module_ops);
 }
 
 #define MAX_DYNAMIC_HCALLS 128
@@ -175,11 +170,7 @@ int __pkvm_register_hcall(unsigned long hvn_hyp_va)
 	dyn_hcall_t hfn = (void *)hvn_hyp_va;
 	int reserved_id, ret;
 
-	pkvm_modules_lock();
-	if (!pkvm_modules_enabled()) {
-		ret = -EACCES;
-		goto err;
-	}
+	assert_in_mod_range(hvn_hyp_va);
 
 	hyp_spin_lock(&dyn_hcall_lock);
 
@@ -201,8 +192,6 @@ int __pkvm_register_hcall(unsigned long hvn_hyp_va)
 	ret = reserved_id + __KVM_HOST_SMCCC_FUNC___dynamic_hcalls;
 err_hcall_unlock:
 	hyp_spin_unlock(&dyn_hcall_lock);
-err:
-	pkvm_modules_unlock();
 
 	return ret;
 };

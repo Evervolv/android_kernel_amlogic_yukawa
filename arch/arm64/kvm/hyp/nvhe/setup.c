@@ -71,6 +71,22 @@ static int divide_memory_pool(void *virt, unsigned long size)
 	return 0;
 }
 
+static int create_hyp_host_fp_mappings(void)
+{
+	void *start, *end;
+	int ret, i;
+
+	for (i = 0; i < hyp_nr_cpus; i++) {
+		start = (void *)kern_hyp_va(kvm_arm_hyp_host_fp_state[i]);
+		end = start + PAGE_ALIGN(pkvm_host_fp_state_size());
+		ret = pkvm_create_mappings(start, end, PAGE_HYP);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 static int recreate_hyp_mappings(phys_addr_t phys, unsigned long size,
 				 unsigned long *per_cpu_base,
 				 u32 hyp_va_bits)
@@ -134,7 +150,7 @@ static int recreate_hyp_mappings(phys_addr_t phys, unsigned long size,
 		 * and guard page. The allocation is also aligned based on
 		 * the order of its size.
 		 */
-		ret = pkvm_alloc_private_va_range(PAGE_SIZE * 2, &hyp_addr);
+		ret = pkvm_alloc_private_va_range(NVHE_STACK_SIZE * 2, &hyp_addr);
 		if (ret)
 			return ret;
 
@@ -143,20 +159,22 @@ static int recreate_hyp_mappings(phys_addr_t phys, unsigned long size,
 		 * at the higher address and leave the lower guard page
 		 * unbacked.
 		 *
-		 * Any valid stack address now has the PAGE_SHIFT bit as 1
+		 * Any valid stack address now has the NVHE_STACK_SHIFT bit as 1
 		 * and addresses corresponding to the guard page have the
-		 * PAGE_SHIFT bit as 0 - this is used for overflow detection.
+		 * NVHE_STACK_SHIFT bit as 0 - this is used for overflow detection.
 		 */
 		hyp_spin_lock(&pkvm_pgd_lock);
-		ret = kvm_pgtable_hyp_map(&pkvm_pgtable, hyp_addr + PAGE_SIZE,
-					PAGE_SIZE, params->stack_pa, PAGE_HYP);
+		ret = kvm_pgtable_hyp_map(&pkvm_pgtable, hyp_addr + NVHE_STACK_SIZE,
+					NVHE_STACK_SIZE, params->stack_pa, PAGE_HYP);
 		hyp_spin_unlock(&pkvm_pgd_lock);
 		if (ret)
 			return ret;
 
 		/* Update stack_hyp_va to end of the stack's private VA range */
-		params->stack_hyp_va = hyp_addr + (2 * PAGE_SIZE);
+		params->stack_hyp_va = hyp_addr + (2 * NVHE_STACK_SIZE);
 	}
+
+	create_hyp_host_fp_mappings();
 
 	/*
 	 * Map the host sections RO in the hypervisor, but transfer the
@@ -271,6 +289,29 @@ static int fix_hyp_pgtable_refcnt_walker(u64 addr, u64 end, u32 level,
 	return 0;
 }
 
+static int pin_table_walker(u64 addr, u64 end, u32 level, kvm_pte_t *ptep,
+			    enum kvm_pgtable_walk_flags flag, void * const arg)
+{
+	struct kvm_pgtable_mm_ops *mm_ops = arg;
+	kvm_pte_t pte = *ptep;
+
+	if (kvm_pte_valid(pte))
+		mm_ops->get_page(kvm_pte_follow(pte, mm_ops));
+
+	return 0;
+}
+
+static int pin_host_tables(void)
+{
+	struct kvm_pgtable_walker walker = {
+		.cb	= pin_table_walker,
+		.flags	= KVM_PGTABLE_WALK_TABLE_POST,
+		.arg	= &host_mmu.mm_ops,
+	};
+
+	return kvm_pgtable_walk(&host_mmu.pgt, 0, BIT(host_mmu.pgt.ia_bits), &walker);
+}
+
 static int fix_host_ownership(void)
 {
 	struct kvm_pgtable_walker walker = {
@@ -312,7 +353,9 @@ static int unmap_protected_regions(void)
 		reg = &pkvm_moveable_regs[i];
 		if (reg->type != PKVM_MREG_PROTECTED_RANGE)
 			continue;
-		ret = host_stage2_protect_pages_locked(reg->start, reg->size);
+
+		ret = host_stage2_set_owner_locked(reg->start, reg->size,
+						   PKVM_ID_PROTECTED);
 		if (ret)
 			return ret;
 	}
@@ -349,10 +392,6 @@ void __noreturn __pkvm_init_finalise(void)
 	};
 	pkvm_pgtable.mm_ops = &pkvm_pgtable_mm_ops;
 
-	ret = fix_host_ownership();
-	if (ret)
-		goto out;
-
 	ret = fix_hyp_pgtable_refcnt();
 	if (ret)
 		goto out;
@@ -361,7 +400,15 @@ void __noreturn __pkvm_init_finalise(void)
 	if (ret)
 		goto out;
 
+	ret = fix_host_ownership();
+	if (ret)
+		goto out;
+
 	ret = unmap_protected_regions();
+	if (ret)
+		goto out;
+
+	ret = pin_host_tables();
 	if (ret)
 		goto out;
 

@@ -79,7 +79,18 @@ int blk_crypto_profile_init(struct blk_crypto_profile *profile,
 	unsigned int slot_hashtable_size;
 
 	memset(profile, 0, sizeof(*profile));
+
+	/*
+	 * profile->lock of an underlying device can nest inside profile->lock
+	 * of a device-mapper device, so use a dynamic lock class to avoid
+	 * false-positive lockdep reports.
+	 */
+#ifdef CONFIG_LOCKDEP
+	lockdep_register_key(&profile->lockdep_key);
+	__init_rwsem(&profile->lock, "&profile->lock", &profile->lockdep_key);
+#else
 	init_rwsem(&profile->lock);
+#endif
 
 	if (num_slots == 0)
 		return 0;
@@ -89,7 +100,7 @@ int blk_crypto_profile_init(struct blk_crypto_profile *profile,
 	profile->slots = kvcalloc(num_slots, sizeof(profile->slots[0]),
 				  GFP_KERNEL);
 	if (!profile->slots)
-		return -ENOMEM;
+		goto err_destroy;
 
 	profile->num_slots = num_slots;
 
@@ -356,28 +367,16 @@ bool __blk_crypto_cfg_supported(struct blk_crypto_profile *profile,
 	return true;
 }
 
-/**
- * __blk_crypto_evict_key() - Evict a key from a device.
- * @profile: the crypto profile of the device
- * @key: the key to evict.  It must not still be used in any I/O.
- *
- * If the device has keyslots, this finds the keyslot (if any) that contains the
- * specified key and calls the driver's keyslot_evict function to evict it.
- *
- * Otherwise, this just calls the driver's keyslot_evict function if it is
- * implemented, passing just the key (without any particular keyslot).  This
- * allows layered devices to evict the key from their underlying devices.
- *
- * Context: Process context. Takes and releases profile->lock.
- * Return: 0 on success or if there's no keyslot with the specified key, -EBUSY
- *	   if the keyslot is still in use, or another -errno value on other
- *	   error.
+/*
+ * This is an internal function that evicts a key from an inline encryption
+ * device that can be either a real device or the blk-crypto-fallback "device".
+ * It is used only by blk_crypto_evict_key(); see that function for details.
  */
 int __blk_crypto_evict_key(struct blk_crypto_profile *profile,
 			   const struct blk_crypto_key *key)
 {
 	struct blk_crypto_keyslot *slot;
-	int err = 0;
+	int err;
 
 	if (profile->num_slots == 0) {
 		if (profile->ll_ops.keyslot_evict) {
@@ -391,22 +390,30 @@ int __blk_crypto_evict_key(struct blk_crypto_profile *profile,
 
 	blk_crypto_hw_enter(profile);
 	slot = blk_crypto_find_keyslot(profile, key);
-	if (!slot)
-		goto out_unlock;
+	if (!slot) {
+		/*
+		 * Not an error, since a key not in use by I/O is not guaranteed
+		 * to be in a keyslot.  There can be more keys than keyslots.
+		 */
+		err = 0;
+		goto out;
+	}
 
 	if (WARN_ON_ONCE(atomic_read(&slot->slot_refs) != 0)) {
+		/* BUG: key is still in use by I/O */
 		err = -EBUSY;
-		goto out_unlock;
+		goto out_remove;
 	}
 	err = profile->ll_ops.keyslot_evict(profile, key,
 					    blk_crypto_keyslot_index(slot));
-	if (err)
-		goto out_unlock;
-
+out_remove:
+	/*
+	 * Callers free the key even on error, so unlink the key from the hash
+	 * table and clear slot->key even on error.
+	 */
 	hlist_del(&slot->hash_node);
 	slot->key = NULL;
-	err = 0;
-out_unlock:
+out:
 	blk_crypto_hw_exit(profile);
 	return err;
 }
@@ -447,6 +454,9 @@ void blk_crypto_profile_destroy(struct blk_crypto_profile *profile)
 {
 	if (!profile)
 		return;
+#ifdef CONFIG_LOCKDEP
+	lockdep_unregister_key(&profile->lockdep_key);
+#endif
 	kvfree(profile->slot_hashtable);
 	kvfree_sensitive(profile->slots,
 			 sizeof(profile->slots[0]) * profile->num_slots);
@@ -468,9 +478,7 @@ EXPORT_SYMBOL_GPL(blk_crypto_register);
 
 /**
  * blk_crypto_derive_sw_secret() - Derive software secret from wrapped key
- * @bdev: a block device whose hardware-wrapped keys implementation is
- *	  compatible (blk_crypto_hw_wrapped_keys_compatible()) with all block
- *	  devices on which the key will be used.
+ * @bdev: a block device that supports hardware-wrapped keys
  * @eph_key: the hardware-wrapped key in ephemerally-wrapped form
  * @eph_key_size: size of @eph_key in bytes
  * @sw_secret: (output) the software secret
@@ -506,20 +514,6 @@ int blk_crypto_derive_sw_secret(struct block_device *bdev,
 	return err;
 }
 EXPORT_SYMBOL_GPL(blk_crypto_derive_sw_secret);
-
-/**
- * blk_crypto_hw_wrapped_keys_compatible() - Check HW-wrapped key compatibility
- * @bdev1: the first block device
- * @bdev2: the second block device
- *
- * Return: true if HW-wrapped keys used on @bdev1 can also be used on @bdev2.
- */
-bool blk_crypto_hw_wrapped_keys_compatible(struct block_device *bdev1,
-					   struct block_device *bdev2)
-{
-	return bdev_get_queue(bdev1)->crypto_profile ==
-		bdev_get_queue(bdev2)->crypto_profile;
-}
 
 /**
  * blk_crypto_intersect_capabilities() - restrict supported crypto capabilities

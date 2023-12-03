@@ -12,6 +12,7 @@
 struct ufs_hba;
 struct request;
 struct ufshcd_lrb;
+struct scsi_device;
 
 DECLARE_HOOK(android_vh_ufs_fill_prdt,
 	TP_PROTO(struct ufs_hba *hba, struct ufshcd_lrb *lrbp,
@@ -49,6 +50,22 @@ DECLARE_HOOK(android_vh_ufs_check_int_errors,
 	TP_PROTO(struct ufs_hba *hba, bool queue_eh_work),
 	TP_ARGS(hba, queue_eh_work));
 
+DECLARE_HOOK(android_vh_ufs_update_sdev,
+	TP_PROTO(struct scsi_device *sdev),
+	TP_ARGS(sdev));
+
+DECLARE_HOOK(android_vh_ufs_clock_scaling,
+		TP_PROTO(struct ufs_hba *hba, bool *force_out, bool *force_scaling, bool *scale_up),
+		TP_ARGS(hba, force_out, force_scaling, scale_up));
+
+DECLARE_HOOK(android_vh_ufs_use_mcq_hooks,
+		TP_PROTO(struct ufs_hba *hba, bool *use_mcq),
+		TP_ARGS(hba, use_mcq));
+
+struct scsi_cmnd;
+DECLARE_HOOK(android_vh_ufs_mcq_abort,
+	TP_PROTO(struct ufs_hba *hba, struct scsi_cmnd *cmd, int *ret),
+	TP_ARGS(hba, cmd, ret));
 #endif /* _TRACE_HOOK_UFSHCD_H */
 /* This part must be outside protection */
 #include <trace/define_trace.h>

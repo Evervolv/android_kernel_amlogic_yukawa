@@ -15,9 +15,11 @@
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/moduleloader.h>
+#include <linux/scs.h>
 #include <linux/vmalloc.h>
 #include <asm/alternative.h>
 #include <asm/insn.h>
+#include <asm/scs.h>
 #include <asm/sections.h>
 
 void *module_alloc(unsigned long size)
@@ -524,39 +526,36 @@ static int module_init_hyp(const Elf_Ehdr *hdr, const Elf_Shdr *sechdrs,
 		.end	= (void *)s->sh_addr + s->sh_size,
 	};
 
-	s = find_section(hdr, sechdrs, ".hyp.bss");
-	if (!s)
-		return -ENOEXEC;
-
-	mod->arch.hyp.bss = (struct pkvm_module_section) {
-		.start	= (void *)s->sh_addr,
-		.end	= (void *)s->sh_addr + s->sh_size,
-	};
-
-	s = find_section(hdr, sechdrs, ".hyp.rodata");
-	if (!s)
-		return -ENOEXEC;
-
-	mod->arch.hyp.rodata = (struct pkvm_module_section) {
-		.start	= (void *)s->sh_addr,
-		.end	= (void *)s->sh_addr + s->sh_size,
-	};
-
-	s = find_section(hdr, sechdrs, ".hyp.data");
-	if (!s)
-		return -ENOEXEC;
-
-	mod->arch.hyp.data = (struct pkvm_module_section) {
-		.start	= (void *)s->sh_addr,
-		.end	= (void *)s->sh_addr + s->sh_size,
-	};
-
 	s = find_section(hdr, sechdrs, ".hyp.reloc");
 	if (!s)
 		return -ENOEXEC;
 
 	mod->arch.hyp.relocs = (void *)s->sh_addr;
 	mod->arch.hyp.nr_relocs = s->sh_size / sizeof(*mod->arch.hyp.relocs);
+
+	s = find_section(hdr, sechdrs, ".hyp.bss");
+	if (s && s->sh_size) {
+		mod->arch.hyp.bss = (struct pkvm_module_section) {
+			.start	= (void *)s->sh_addr,
+			.end	= (void *)s->sh_addr + s->sh_size,
+		};
+	}
+
+	s = find_section(hdr, sechdrs, ".hyp.rodata");
+	if (s && s->sh_size) {
+		mod->arch.hyp.rodata = (struct pkvm_module_section) {
+			.start	= (void *)s->sh_addr,
+			.end	= (void *)s->sh_addr + s->sh_size,
+		};
+	}
+
+	s = find_section(hdr, sechdrs, ".hyp.data");
+	if (s && s->sh_size) {
+		mod->arch.hyp.data = (struct pkvm_module_section) {
+			.start	= (void *)s->sh_addr,
+			.end	= (void *)s->sh_addr + s->sh_size,
+		};
+	}
 #endif
 	return 0;
 }
@@ -571,6 +570,12 @@ int module_finalize(const Elf_Ehdr *hdr,
 	s = find_section(hdr, sechdrs, ".altinstructions");
 	if (s)
 		apply_alternatives_module((void *)s->sh_addr, s->sh_size);
+
+	if (scs_is_dynamic()) {
+		s = find_section(hdr, sechdrs, ".init.eh_frame");
+		if (s)
+			scs_patch((void *)s->sh_addr, s->sh_size);
+	}
 
 	err = module_init_ftrace_plt(hdr, sechdrs, me);
 	if (err)

@@ -16,7 +16,6 @@
 #include <linux/fs.h>
 #include <linux/mman.h>
 #include <linux/sched.h>
-#include <linux/kmemleak.h>
 #include <linux/kvm.h>
 #include <linux/kvm_irqfd.h>
 #include <linux/irqbypass.h>
@@ -26,6 +25,8 @@
 
 #define CREATE_TRACE_POINTS
 #include "trace_arm.h"
+
+#include "hyp_trace.h"
 
 #include <linux/uaccess.h>
 #include <asm/ptrace.h>
@@ -46,11 +47,10 @@
 #include <kvm/arm_psci.h>
 
 static enum kvm_mode kvm_mode = KVM_MODE_DEFAULT;
-DEFINE_STATIC_KEY_FALSE(kvm_protected_mode_initialized);
 
 DECLARE_KVM_HYP_PER_CPU(unsigned long, kvm_hyp_vector);
 
-DEFINE_PER_CPU(unsigned long, kvm_arm_hyp_stack_page);
+DEFINE_PER_CPU(unsigned long, kvm_arm_hyp_stack_base);
 DECLARE_KVM_NVHE_PER_CPU(struct kvm_nvhe_init_params, kvm_init_params);
 DECLARE_KVM_NVHE_PER_CPU(int, hyp_cpu_number);
 
@@ -154,6 +154,16 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
 
 	if (type & ~KVM_VM_TYPE_MASK)
 		return -EINVAL;
+
+	mutex_init(&kvm->arch.config_lock);
+
+#ifdef CONFIG_LOCKDEP
+	/* Clue in lockdep that the config_lock must be taken inside kvm->lock */
+	mutex_lock(&kvm->lock);
+	mutex_lock(&kvm->arch.config_lock);
+	mutex_unlock(&kvm->arch.config_lock);
+	mutex_unlock(&kvm->lock);
+#endif
 
 	ret = kvm_share_hyp(kvm, kvm + 1);
 	if (ret)
@@ -423,6 +433,16 @@ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
 {
 	int err;
 
+	spin_lock_init(&vcpu->arch.mp_state_lock);
+
+#ifdef CONFIG_LOCKDEP
+	/* Inform lockdep that the config_lock is acquired after vcpu->mutex */
+	mutex_lock(&vcpu->mutex);
+	mutex_lock(&vcpu->kvm->arch.config_lock);
+	mutex_unlock(&vcpu->kvm->arch.config_lock);
+	mutex_unlock(&vcpu->mutex);
+#endif
+
 	/* Force users to call KVM_ARM_VCPU_INIT */
 	vcpu->arch.target = -1;
 	bitmap_zero(vcpu->arch.features, KVM_VCPU_MAX_FEATURES);
@@ -566,34 +586,41 @@ void kvm_arch_vcpu_put(struct kvm_vcpu *vcpu)
 	vcpu->cpu = -1;
 }
 
-void kvm_arm_vcpu_power_off(struct kvm_vcpu *vcpu)
+static void __kvm_arm_vcpu_power_off(struct kvm_vcpu *vcpu)
 {
-	vcpu->arch.mp_state.mp_state = KVM_MP_STATE_STOPPED;
+	WRITE_ONCE(vcpu->arch.mp_state.mp_state, KVM_MP_STATE_STOPPED);
 	kvm_make_request(KVM_REQ_SLEEP, vcpu);
 	kvm_vcpu_kick(vcpu);
 }
 
+void kvm_arm_vcpu_power_off(struct kvm_vcpu *vcpu)
+{
+	spin_lock(&vcpu->arch.mp_state_lock);
+	__kvm_arm_vcpu_power_off(vcpu);
+	spin_unlock(&vcpu->arch.mp_state_lock);
+}
+
 bool kvm_arm_vcpu_stopped(struct kvm_vcpu *vcpu)
 {
-	return vcpu->arch.mp_state.mp_state == KVM_MP_STATE_STOPPED;
+	return READ_ONCE(vcpu->arch.mp_state.mp_state) == KVM_MP_STATE_STOPPED;
 }
 
 static void kvm_arm_vcpu_suspend(struct kvm_vcpu *vcpu)
 {
-	vcpu->arch.mp_state.mp_state = KVM_MP_STATE_SUSPENDED;
+	WRITE_ONCE(vcpu->arch.mp_state.mp_state, KVM_MP_STATE_SUSPENDED);
 	kvm_make_request(KVM_REQ_SUSPEND, vcpu);
 	kvm_vcpu_kick(vcpu);
 }
 
 static bool kvm_arm_vcpu_suspended(struct kvm_vcpu *vcpu)
 {
-	return vcpu->arch.mp_state.mp_state == KVM_MP_STATE_SUSPENDED;
+	return READ_ONCE(vcpu->arch.mp_state.mp_state) == KVM_MP_STATE_SUSPENDED;
 }
 
 int kvm_arch_vcpu_ioctl_get_mpstate(struct kvm_vcpu *vcpu,
 				    struct kvm_mp_state *mp_state)
 {
-	*mp_state = vcpu->arch.mp_state;
+	*mp_state = READ_ONCE(vcpu->arch.mp_state);
 
 	return 0;
 }
@@ -603,12 +630,14 @@ int kvm_arch_vcpu_ioctl_set_mpstate(struct kvm_vcpu *vcpu,
 {
 	int ret = 0;
 
+	spin_lock(&vcpu->arch.mp_state_lock);
+
 	switch (mp_state->mp_state) {
 	case KVM_MP_STATE_RUNNABLE:
-		vcpu->arch.mp_state = *mp_state;
+		WRITE_ONCE(vcpu->arch.mp_state, *mp_state);
 		break;
 	case KVM_MP_STATE_STOPPED:
-		kvm_arm_vcpu_power_off(vcpu);
+		__kvm_arm_vcpu_power_off(vcpu);
 		break;
 	case KVM_MP_STATE_SUSPENDED:
 		kvm_arm_vcpu_suspend(vcpu);
@@ -616,6 +645,8 @@ int kvm_arch_vcpu_ioctl_set_mpstate(struct kvm_vcpu *vcpu,
 	default:
 		ret = -EINVAL;
 	}
+
+	spin_unlock(&vcpu->arch.mp_state_lock);
 
 	return ret;
 }
@@ -711,9 +742,9 @@ int kvm_arch_vcpu_run_pid_change(struct kvm_vcpu *vcpu)
 		static_branch_inc(&userspace_irqchip_in_use);
 	}
 
-	mutex_lock(&kvm->lock);
+	mutex_lock(&kvm->arch.config_lock);
 	set_bit(KVM_ARCH_FLAG_HAS_RAN_ONCE, &kvm->arch.flags);
-	mutex_unlock(&kvm->lock);
+	mutex_unlock(&kvm->arch.config_lock);
 
 	return ret;
 }
@@ -787,6 +818,8 @@ void kvm_vcpu_wfi(struct kvm_vcpu *vcpu)
 	 */
 	preempt_disable();
 	kvm_vgic_put(vcpu, true);
+	vcpu_set_flag(vcpu, IN_WFI);
+	vgic_v4_put(vcpu);
 	preempt_enable();
 
 	kvm_vcpu_halt(vcpu);
@@ -794,6 +827,8 @@ void kvm_vcpu_wfi(struct kvm_vcpu *vcpu)
 
 	preempt_disable();
 	kvm_vgic_load(vcpu);
+	vcpu_clear_flag(vcpu, IN_WFI);
+	vgic_v4_load(vcpu);
 	preempt_enable();
 }
 
@@ -860,7 +895,7 @@ static int check_vcpu_requests(struct kvm_vcpu *vcpu)
 		if (kvm_check_request(KVM_REQ_RELOAD_GICv4, vcpu)) {
 			/* The distributor enable bits were changed */
 			preempt_disable();
-			vgic_v4_put(vcpu, false);
+			vgic_v4_put(vcpu);
 			vgic_v4_load(vcpu);
 			preempt_enable();
 		}
@@ -1327,7 +1362,7 @@ static int kvm_arch_vcpu_ioctl_vcpu_init(struct kvm_vcpu *vcpu,
 	if (test_bit(KVM_ARM_VCPU_POWER_OFF, vcpu->arch.features))
 		kvm_arm_vcpu_power_off(vcpu);
 	else
-		vcpu->arch.mp_state.mp_state = KVM_MP_STATE_RUNNABLE;
+		WRITE_ONCE(vcpu->arch.mp_state.mp_state, KVM_MP_STATE_RUNNABLE);
 
 	return 0;
 }
@@ -1611,6 +1646,11 @@ static unsigned long nvhe_percpu_order(void)
 	return size ? get_order(size) : 0;
 }
 
+static inline size_t pkvm_host_fp_state_order(void)
+{
+	return get_order(pkvm_host_fp_state_size());
+}
+
 /* A lookup table holding the hypervisor VA for each vector slot */
 static void *hyp_spectre_vector_selector[BP_HARDEN_EL2_SLOTS];
 
@@ -1687,6 +1727,7 @@ static void cpu_prepare_hyp_mode(int cpu)
 	else
 		params->hcr_el2 = HCR_HOST_NVHE_FLAGS;
 	params->vttbr = params->vtcr = 0;
+	params->hfgwtr_el2 = HFGxTR_EL2_nSMPRI_EL1_MASK | HFGxTR_EL2_nTPIDR2_EL0_MASK;
 
 	/*
 	 * Flush the init params from the data cache because the struct will
@@ -1972,8 +2013,10 @@ static void teardown_hyp_mode(void)
 
 	free_hyp_pgds();
 	for_each_possible_cpu(cpu) {
-		free_page(per_cpu(kvm_arm_hyp_stack_page, cpu));
+		free_pages(per_cpu(kvm_arm_hyp_stack_base, cpu), NVHE_STACK_SHIFT - PAGE_SHIFT);
 		free_pages(kvm_nvhe_sym(kvm_arm_hyp_percpu_base)[cpu], nvhe_percpu_order());
+		free_pages(kvm_nvhe_sym(kvm_arm_hyp_host_fp_state)[cpu],
+					pkvm_host_fp_state_order());
 	}
 }
 
@@ -1999,9 +2042,33 @@ static int do_pkvm_init(u32 hyp_va_bits)
 	return ret;
 }
 
+static u64 get_hyp_id_aa64pfr0_el1(void)
+{
+	/*
+	 * Track whether the system isn't affected by spectre/meltdown in the
+	 * hypervisor's view of id_aa64pfr0_el1, used for protected VMs.
+	 * Although this is per-CPU, we make it global for simplicity, e.g., not
+	 * to have to worry about vcpu migration.
+	 *
+	 * Unlike for non-protected VMs, userspace cannot override this for
+	 * protected VMs.
+	 */
+	u64 val = read_sanitised_ftr_reg(SYS_ID_AA64PFR0_EL1);
+
+	val &= ~(ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_CSV2) |
+		 ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_CSV3));
+
+	val |= FIELD_PREP(ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_CSV2),
+			  arm64_get_spectre_v2_state() == SPECTRE_UNAFFECTED);
+	val |= FIELD_PREP(ARM64_FEATURE_MASK(ID_AA64PFR0_EL1_CSV3),
+			  arm64_get_meltdown_state() == SPECTRE_UNAFFECTED);
+
+	return val;
+}
+
 static void kvm_hyp_init_symbols(void)
 {
-	kvm_nvhe_sym(id_aa64pfr0_el1_sys_val) = read_sanitised_ftr_reg(SYS_ID_AA64PFR0_EL1);
+	kvm_nvhe_sym(id_aa64pfr0_el1_sys_val) = get_hyp_id_aa64pfr0_el1();
 	kvm_nvhe_sym(id_aa64pfr1_el1_sys_val) = read_sanitised_ftr_reg(SYS_ID_AA64PFR1_EL1);
 	kvm_nvhe_sym(id_aa64isar0_el1_sys_val) = read_sanitised_ftr_reg(SYS_ID_AA64ISAR0_EL1);
 	kvm_nvhe_sym(id_aa64isar1_el1_sys_val) = read_sanitised_ftr_reg(SYS_ID_AA64ISAR1_EL1);
@@ -2009,10 +2076,14 @@ static void kvm_hyp_init_symbols(void)
 	kvm_nvhe_sym(id_aa64mmfr0_el1_sys_val) = read_sanitised_ftr_reg(SYS_ID_AA64MMFR0_EL1);
 	kvm_nvhe_sym(id_aa64mmfr1_el1_sys_val) = read_sanitised_ftr_reg(SYS_ID_AA64MMFR1_EL1);
 	kvm_nvhe_sym(id_aa64mmfr2_el1_sys_val) = read_sanitised_ftr_reg(SYS_ID_AA64MMFR2_EL1);
+	kvm_nvhe_sym(id_aa64smfr0_el1_sys_val) = read_sanitised_ftr_reg(SYS_ID_AA64SMFR0_EL1);
 	kvm_nvhe_sym(__icache_flags) = __icache_flags;
 	kvm_nvhe_sym(kvm_arm_vmid_bits) = kvm_arm_vmid_bits;
 	kvm_nvhe_sym(smccc_trng_available) = smccc_trng_available;
+	kvm_nvhe_sym(kvm_host_sve_max_vl) = kvm_host_sve_max_vl;
 }
+
+int kvm_hyp_init_events(void);
 
 static int kvm_hyp_init_protection(u32 hyp_va_bits)
 {
@@ -2030,6 +2101,48 @@ static int kvm_hyp_init_protection(u32 hyp_va_bits)
 	free_hyp_pgds();
 
 	return 0;
+}
+
+static int init_pkvm_host_fp_state(void)
+{
+	int cpu;
+
+	if (!is_protected_kvm_enabled())
+		return 0;
+
+	/* Allocate pages for protected-mode host-fp state. */
+	for_each_possible_cpu(cpu) {
+		struct page *page;
+		unsigned long addr;
+
+		page = alloc_pages(GFP_KERNEL, pkvm_host_fp_state_order());
+		if (!page)
+			return -ENOMEM;
+
+		addr = (unsigned long)page_address(page);
+		kvm_nvhe_sym(kvm_arm_hyp_host_fp_state)[cpu] = addr;
+	}
+
+	/*
+	 * Don't map the pages in hyp since these are only used in protected
+	 * mode, which will (re)create its own mapping when initialized.
+	 */
+
+	return 0;
+}
+
+/*
+ * Finalizes the initialization of hyp mode, once everything else is initialized
+ * and the initialziation process cannot fail.
+ */
+static void finalize_init_hyp_mode(void)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		kvm_nvhe_sym(kvm_arm_hyp_host_fp_state)[cpu] =
+			kern_hyp_va(kvm_nvhe_sym(kvm_arm_hyp_host_fp_state)[cpu]);
+	}
 }
 
 /**
@@ -2059,15 +2172,15 @@ static int init_hyp_mode(void)
 	 * Allocate stack pages for Hypervisor-mode
 	 */
 	for_each_possible_cpu(cpu) {
-		unsigned long stack_page;
+		unsigned long stack_base;
 
-		stack_page = __get_free_page(GFP_KERNEL);
-		if (!stack_page) {
+		stack_base = __get_free_pages(GFP_KERNEL, NVHE_STACK_SHIFT - PAGE_SHIFT);
+		if (!stack_base) {
 			err = -ENOMEM;
 			goto out_err;
 		}
 
-		per_cpu(kvm_arm_hyp_stack_page, cpu) = stack_page;
+		per_cpu(kvm_arm_hyp_stack_base, cpu) = stack_base;
 	}
 
 	/*
@@ -2143,7 +2256,7 @@ static int init_hyp_mode(void)
 	 */
 	for_each_possible_cpu(cpu) {
 		struct kvm_nvhe_init_params *params = per_cpu_ptr_nvhe_sym(kvm_init_params, cpu);
-		char *stack_page = (char *)per_cpu(kvm_arm_hyp_stack_page, cpu);
+		char *stack_base = (char *)per_cpu(kvm_arm_hyp_stack_base, cpu);
 		unsigned long hyp_addr;
 
 		/*
@@ -2151,7 +2264,7 @@ static int init_hyp_mode(void)
 		 * and guard page. The allocation is also aligned based on
 		 * the order of its size.
 		 */
-		err = hyp_alloc_private_va_range(PAGE_SIZE * 2, &hyp_addr);
+		err = hyp_alloc_private_va_range(NVHE_STACK_SIZE * 2, &hyp_addr);
 		if (err) {
 			kvm_err("Cannot allocate hyp stack guard page\n");
 			goto out_err;
@@ -2162,12 +2275,12 @@ static int init_hyp_mode(void)
 		 * at the higher address and leave the lower guard page
 		 * unbacked.
 		 *
-		 * Any valid stack address now has the PAGE_SHIFT bit as 1
+		 * Any valid stack address now has the NVHE_STACK_SHIFT bit as 1
 		 * and addresses corresponding to the guard page have the
-		 * PAGE_SHIFT bit as 0 - this is used for overflow detection.
+		 * NVHE_STACK_SHIFT bit as 0 - this is used for overflow detection.
 		 */
-		err = __create_hyp_mappings(hyp_addr + PAGE_SIZE, PAGE_SIZE,
-					    __pa(stack_page), PAGE_HYP);
+		err = __create_hyp_mappings(hyp_addr + NVHE_STACK_SIZE, NVHE_STACK_SIZE,
+					    __pa(stack_base), PAGE_HYP);
 		if (err) {
 			kvm_err("Cannot map hyp stack\n");
 			goto out_err;
@@ -2179,9 +2292,9 @@ static int init_hyp_mode(void)
 		 * __hyp_pa() won't do the right thing there, since the stack
 		 * has been mapped in the flexible private VA space.
 		 */
-		params->stack_pa = __pa(stack_page);
+		params->stack_pa = __pa(stack_base);
 
-		params->stack_hyp_va = hyp_addr + (2 * PAGE_SIZE);
+		params->stack_hyp_va = hyp_addr + (2 * NVHE_STACK_SIZE);
 	}
 
 	for_each_possible_cpu(cpu) {
@@ -2199,7 +2312,16 @@ static int init_hyp_mode(void)
 		cpu_prepare_hyp_mode(cpu);
 	}
 
+	err = init_pkvm_host_fp_state();
+	if (err)
+		goto out_err;
+
 	kvm_hyp_init_symbols();
+
+	/* TODO: Real .h interface */
+#ifdef CONFIG_TRACING
+	kvm_hyp_init_events();
+#endif
 
 	if (is_protected_kvm_enabled()) {
 		init_cpu_logical_map();
@@ -2222,52 +2344,6 @@ out_err:
 	teardown_hyp_mode();
 	kvm_err("error initializing Hyp mode: %d\n", err);
 	return err;
-}
-
-static void _kvm_host_prot_finalize(void *arg)
-{
-	int *err = arg;
-
-	if (WARN_ON(kvm_call_hyp_nvhe(__pkvm_prot_finalize)))
-		WRITE_ONCE(*err, -EINVAL);
-}
-
-static int pkvm_drop_host_privileges(void)
-{
-	int ret = 0;
-
-	/*
-	 * Flip the static key upfront as that may no longer be possible
-	 * once the host stage 2 is installed.
-	 */
-	static_branch_enable(&kvm_protected_mode_initialized);
-
-	/*
-	 * Fixup the boot mode so that we don't take spurious round
-	 * trips via EL2 on cpu_resume. Flush to the PoC for a good
-	 * measure, so that it can be observed by a CPU coming out of
-	 * suspend with the MMU off.
-	 */
-	__boot_cpu_mode[0] = __boot_cpu_mode[1] = BOOT_CPU_MODE_EL1;
-	dcache_clean_poc((unsigned long)__boot_cpu_mode,
-			 (unsigned long)(__boot_cpu_mode + 2));
-
-	on_each_cpu(_kvm_host_prot_finalize, &ret, 1);
-	return ret;
-}
-
-static int finalize_hyp_mode(void)
-{
-	if (!is_protected_kvm_enabled())
-		return 0;
-
-	/*
-	 * Exclude HYP sections from kmemleak so that they don't get peeked
-	 * at, which would end badly once inaccessible.
-	 */
-	kmemleak_free_part(__hyp_bss_start, __hyp_bss_end - __hyp_bss_start);
-	kmemleak_free_part_phys(hyp_mem_base, hyp_mem_size);
-	return pkvm_drop_host_privileges();
 }
 
 struct kvm_vcpu *kvm_mpidr_to_vcpu(struct kvm *kvm, unsigned long mpidr)
@@ -2385,11 +2461,9 @@ int kvm_arch_init(void *opaque)
 		goto out_hyp;
 
 	if (!in_hyp_mode) {
-		err = finalize_hyp_mode();
-		if (err) {
-			kvm_err("Failed to finalize Hyp protection\n");
-			goto out_hyp;
-		}
+		err = init_hyp_tracefs();
+		if (err)
+			kvm_err("Failed to initialize Hyp tracing\n");
 	}
 
 	if (is_protected_kvm_enabled()) {
@@ -2399,6 +2473,13 @@ int kvm_arch_init(void *opaque)
 	} else {
 		kvm_info("Hyp mode initialized successfully\n");
 	}
+
+	/*
+	 * This should be called after initialization is done and failure isn't
+	 * possible anymore.
+	 */
+	if (!in_hyp_mode)
+		finalize_init_hyp_mode();
 
 	return 0;
 

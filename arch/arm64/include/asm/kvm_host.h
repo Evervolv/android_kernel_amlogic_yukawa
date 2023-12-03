@@ -67,6 +67,7 @@ enum kvm_mode kvm_get_mode(void);
 DECLARE_STATIC_KEY_FALSE(userspace_irqchip_in_use);
 
 extern unsigned int kvm_sve_max_vl;
+extern unsigned int kvm_host_sve_max_vl;
 int kvm_arm_init_sve(void);
 
 u32 __attribute_const__ kvm_target_cpu(void);
@@ -201,6 +202,11 @@ struct kvm_arch {
 
 	/* Mandated version of PSCI */
 	u32 psci_version;
+
+#ifndef __GENKSYMS__
+	/* Protects VM-scoped configuration data */
+	struct mutex config_lock;
+#endif
 
 	/*
 	 * If we encounter a data abort without valid instruction syndrome
@@ -349,7 +355,11 @@ struct kvm_cpu_context {
 
 	u64 sys_regs[NR_SYS_REGS];
 
+#ifdef __GENKSYMS__
 	struct kvm_vcpu *__hyp_running_vcpu;
+#else
+	void *__hyp_running_vcpu;
+#endif
 };
 
 struct kvm_host_data {
@@ -392,21 +402,20 @@ struct pkvm_iommu_driver {
 	atomic_t state;
 };
 
-extern struct pkvm_iommu_driver kvm_nvhe_sym(pkvm_s2mpu_driver);
-extern struct pkvm_iommu_driver kvm_nvhe_sym(pkvm_sysmmu_sync_driver);
-
-int pkvm_iommu_driver_init(struct pkvm_iommu_driver *drv, void *data, size_t size);
-int pkvm_iommu_register(struct device *dev, struct pkvm_iommu_driver *drv,
-			phys_addr_t pa, size_t size, struct device *parent);
+int pkvm_iommu_driver_init(u64 drv, void *data, size_t size);
+int pkvm_iommu_register(struct device *dev, u64 drv, phys_addr_t pa,
+			size_t size, struct device *parent, u8 flags);
 int pkvm_iommu_suspend(struct device *dev);
 int pkvm_iommu_resume(struct device *dev);
 
-int pkvm_iommu_s2mpu_init(u32 version);
-int pkvm_iommu_s2mpu_register(struct device *dev, phys_addr_t pa);
-int pkvm_iommu_sysmmu_sync_register(struct device *dev, phys_addr_t pa,
-				    struct device *parent);
-/* Reject future calls to pkvm_iommu_driver_init() and pkvm_iommu_register(). */
-int pkvm_iommu_finalize(void);
+/*
+ * Reject future calls to pkvm_iommu_driver_init() and pkvm_iommu_register()
+ * and report errors if found. Incase of errors pKVM can take proper actions
+ * as erasing pvmfw.
+ */
+int pkvm_iommu_finalize(int err);
+
+bool pkvm_iommu_finalized(void);
 
 struct vcpu_reset_state {
 	unsigned long	pc;
@@ -480,7 +489,6 @@ struct kvm_vcpu_arch {
 	struct kvm_guest_debug_arch external_debug_state;
 
 	struct user_fpsimd_state *host_fpsimd_state;	/* hyp VA */
-	struct task_struct *parent_task;
 
 	struct {
 		/* {Break,watch}point registers */
@@ -510,6 +518,9 @@ struct kvm_vcpu_arch {
 
 	/* vcpu power state */
 	struct kvm_mp_state mp_state;
+#ifndef __GENKSYMS__
+	spinlock_t mp_state_lock;
+#endif
 
 	union {
 		/* Cache some mmu pages needed inside spinlock regions */
@@ -565,8 +576,21 @@ struct kvm_vcpu_arch {
 	({							\
 		__build_check_flag(v, flagset, f, m);		\
 								\
-		v->arch.flagset & (m);				\
+		READ_ONCE(v->arch.flagset) & (m);		\
 	})
+
+/*
+ * Note that the set/clear accessors must be preempt-safe in order to
+ * avoid nesting them with load/put which also manipulate flags...
+ */
+#ifdef __KVM_NVHE_HYPERVISOR__
+/* the nVHE hypervisor is always non-preemptible */
+#define __vcpu_flags_preempt_disable()
+#define __vcpu_flags_preempt_enable()
+#else
+#define __vcpu_flags_preempt_disable()	preempt_disable()
+#define __vcpu_flags_preempt_enable()	preempt_enable()
+#endif
 
 #define __vcpu_set_flag(v, flagset, f, m)			\
 	do {							\
@@ -575,9 +599,11 @@ struct kvm_vcpu_arch {
 		__build_check_flag(v, flagset, f, m);		\
 								\
 		fset = &v->arch.flagset;			\
+		__vcpu_flags_preempt_disable();			\
 		if (HWEIGHT(m) > 1)				\
 			*fset &= ~(m);				\
 		*fset |= (f);					\
+		__vcpu_flags_preempt_enable();			\
 	} while (0)
 
 #define __vcpu_clear_flag(v, flagset, f, m)			\
@@ -587,7 +613,9 @@ struct kvm_vcpu_arch {
 		__build_check_flag(v, flagset, f, m);		\
 								\
 		fset = &v->arch.flagset;			\
+		__vcpu_flags_preempt_disable();			\
 		*fset &= ~(m);					\
+		__vcpu_flags_preempt_enable();			\
 	} while (0)
 
 #define __vcpu_copy_flag(vt, vs, flagset, f, m)			\
@@ -596,12 +624,14 @@ struct kvm_vcpu_arch {
 								\
 		__build_check_flag(vs, flagset, f, m);		\
 								\
+		__vcpu_flags_preempt_disable();			\
 		val = READ_ONCE(vs->arch.flagset);		\
 		val &= (m);					\
 		tmp = READ_ONCE(vt->arch.flagset);		\
 		tmp &= ~(m);					\
 		tmp |= val;					\
 		WRITE_ONCE(vt->arch.flagset, tmp);		\
+		__vcpu_flags_preempt_enable();			\
 	} while (0)
 
 
@@ -674,6 +704,8 @@ struct kvm_vcpu_arch {
 #define SYSREGS_ON_CPU		__vcpu_single_flag(sflags, BIT(4))
 /* Software step state is Active-pending */
 #define DBG_SS_ACTIVE_PENDING	__vcpu_single_flag(sflags, BIT(5))
+/* WFI instruction trapped */
+#define IN_WFI			__vcpu_single_flag(sflags, BIT(7))
 
 
 /* Pointer to the vcpu's SVE FFR for sve_{save,load}_state() */
@@ -1062,7 +1094,6 @@ void kvm_arch_vcpu_load_fp(struct kvm_vcpu *vcpu);
 void kvm_arch_vcpu_ctxflush_fp(struct kvm_vcpu *vcpu);
 void kvm_arch_vcpu_ctxsync_fp(struct kvm_vcpu *vcpu);
 void kvm_arch_vcpu_put_fp(struct kvm_vcpu *vcpu);
-void kvm_vcpu_unshare_task_fp(struct kvm_vcpu *vcpu);
 
 static inline bool kvm_pmu_counter_deferred(struct perf_event_attr *attr)
 {

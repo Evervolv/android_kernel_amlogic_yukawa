@@ -27,7 +27,7 @@ unsigned int sysctl_sched_rt_period = 1000000;
 int sysctl_sched_rt_runtime = 950000;
 
 #ifdef CONFIG_SYSCTL
-static int sysctl_sched_rr_timeslice = (MSEC_PER_SEC / HZ) * RR_TIMESLICE;
+static int sysctl_sched_rr_timeslice = (MSEC_PER_SEC * RR_TIMESLICE) / HZ;
 static int sched_rt_handler(struct ctl_table *table, int write, void *buffer,
 		size_t *lenp, loff_t *ppos);
 static int sched_rr_handler(struct ctl_table *table, int write, void *buffer,
@@ -1073,6 +1073,8 @@ static void update_curr_rt(struct rq *rq)
 
 	update_current_exec_runtime(curr, now, delta_exec);
 
+	trace_android_vh_sched_stat_runtime_rt(curr, delta_exec);
+
 	if (!rt_bandwidth_enabled())
 		return;
 
@@ -1846,6 +1848,7 @@ static inline void set_next_task_rt(struct rq *rq, struct task_struct *p, bool f
 	 */
 	if (rq->curr->sched_class != &rt_sched_class)
 		update_rt_rq_load_avg(rq_clock_pelt(rq), rq, 0);
+	trace_android_rvh_update_rt_rq_load_avg(rq_clock_pelt(rq), rq, p, 0);
 
 	rt_queue_push_tasks(rq);
 }
@@ -1861,6 +1864,8 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
 	BUG_ON(idx >= MAX_RT_PRIO);
 
 	queue = array->queue + idx;
+	if (SCHED_WARN_ON(list_empty(queue)))
+		return NULL;
 	next = list_entry(queue->next, struct sched_rt_entity, run_list);
 
 	return next;
@@ -1873,7 +1878,8 @@ static struct task_struct *_pick_next_task_rt(struct rq *rq)
 
 	do {
 		rt_se = pick_next_rt_entity(rt_rq);
-		BUG_ON(!rt_se);
+		if (unlikely(!rt_se))
+			return NULL;
 		rt_rq = group_rt_rq(rt_se);
 	} while (rt_rq);
 
@@ -1913,6 +1919,7 @@ static void put_prev_task_rt(struct rq *rq, struct task_struct *p)
 	update_curr_rt(rq);
 
 	update_rt_rq_load_avg(rq_clock_pelt(rq), rq, 1);
+	trace_android_rvh_update_rt_rq_load_avg(rq_clock_pelt(rq), rq, p, 1);
 
 	/*
 	 * The previous task needs to be made eligible for pushing
@@ -2091,11 +2098,15 @@ static struct rq *find_lock_lowest_rq(struct task_struct *task, struct rq *rq)
 			 * the mean time, task could have
 			 * migrated already or had its affinity changed.
 			 * Also make sure that it wasn't scheduled on its rq.
+			 * It is possible the task was scheduled, set
+			 * "migrate_disabled" and then got preempted, so we must
+			 * check the task migration disable flag here too.
 			 */
 			if (unlikely(task_rq(task) != rq ||
 				     !cpumask_test_cpu(lowest_rq->cpu, &task->cpus_mask) ||
 				     task_on_cpu(rq, task) ||
 				     !rt_task(task) ||
+				     is_migration_disabled(task) ||
 				     !task_on_rq_queued(task))) {
 
 				double_unlock_balance(rq, lowest_rq);
@@ -2732,6 +2743,7 @@ static void task_tick_rt(struct rq *rq, struct task_struct *p, int queued)
 
 	update_curr_rt(rq);
 	update_rt_rq_load_avg(rq_clock_pelt(rq), rq, 1);
+	trace_android_rvh_update_rt_rq_load_avg(rq_clock_pelt(rq), rq, p, 1);
 
 	watchdog(rq, p);
 

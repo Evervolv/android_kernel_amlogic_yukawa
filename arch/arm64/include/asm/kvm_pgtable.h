@@ -72,7 +72,10 @@ typedef u64 kvm_pte_t;
 
 #define KVM_PTE_LEAF_ATTR_HI_S1_XN	BIT(54)
 
-#define KVM_PTE_LEAF_ATTR_HI_S2_XN	BIT(54)
+#define KVM_PTE_LEAF_ATTR_HI_S2_XN_PXN	1
+#define KVM_PTE_LEAF_ATTR_HI_S2_XN_UXN	3
+#define KVM_PTE_LEAF_ATTR_HI_S2_XN_XN	2
+#define KVM_PTE_LEAF_ATTR_HI_S2_XN	GENMASK(54, 53)
 
 static inline bool kvm_pte_valid(kvm_pte_t pte)
 {
@@ -167,6 +170,11 @@ struct kvm_pgtable_mm_ops {
 	void		(*icache_inval_pou)(void *addr, size_t size);
 };
 
+static inline kvm_pte_t *kvm_pte_follow(kvm_pte_t pte, struct kvm_pgtable_mm_ops *mm_ops)
+{
+	return mm_ops->phys_to_virt(kvm_pte_to_phys(pte));
+}
+
 /**
  * enum kvm_pgtable_stage2_flags - Stage-2 page-table flags.
  * @KVM_PGTABLE_S2_NOFWB:	Don't enforce Normal-WB even if the CPUs have
@@ -184,7 +192,9 @@ enum kvm_pgtable_stage2_flags {
  * @KVM_PGTABLE_PROT_W:		Write permission.
  * @KVM_PGTABLE_PROT_R:		Read permission.
  * @KVM_PGTABLE_PROT_DEVICE:	Device attributes.
- * @KVM_PGTABLE_PROT_NC:       Normal non-cacheable attributes.
+ * @KVM_PGTABLE_PROT_NC:	Normal non-cacheable attributes.
+ * @KVM_PGTABLE_PROT_PXN:	Privileged execute-never.
+ * @KVM_PGTABLE_PROT_UXN:	Unprivileged execute-never.
  * @KVM_PGTABLE_PROT_SW0:	Software bit 0.
  * @KVM_PGTABLE_PROT_SW1:	Software bit 1.
  * @KVM_PGTABLE_PROT_SW2:	Software bit 2.
@@ -197,6 +207,8 @@ enum kvm_pgtable_prot {
 
 	KVM_PGTABLE_PROT_DEVICE			= BIT(3),
 	KVM_PGTABLE_PROT_NC			= BIT(4),
+	KVM_PGTABLE_PROT_PXN			= BIT(5),
+	KVM_PGTABLE_PROT_UXN			= BIT(6),
 
 	KVM_PGTABLE_PROT_SW0			= BIT(55),
 	KVM_PGTABLE_PROT_SW1			= BIT(56),
@@ -209,6 +221,20 @@ enum kvm_pgtable_prot {
 
 #define PKVM_HOST_MEM_PROT	KVM_PGTABLE_PROT_RWX
 #define PKVM_HOST_MMIO_PROT	KVM_PGTABLE_PROT_RW
+
+#define KVM_HOST_S2_DEFAULT_MASK   (KVM_PTE_LEAF_ATTR_HI |	\
+				    KVM_PTE_LEAF_ATTR_LO)
+
+#define KVM_HOST_S2_DEFAULT_MEM_PTE		\
+	(PTE_S2_MEMATTR(MT_S2_NORMAL) |		\
+	KVM_PTE_LEAF_ATTR_LO_S2_S2AP_R |	\
+	KVM_PTE_LEAF_ATTR_LO_S2_S2AP_W |	\
+	KVM_PTE_LEAF_ATTR_LO_S2_AF |		\
+	FIELD_PREP(KVM_PTE_LEAF_ATTR_LO_S2_SH, KVM_PTE_LEAF_ATTR_LO_S2_SH_IS))
+
+#define KVM_HOST_S2_DEFAULT_MMIO_PTE		\
+	(KVM_HOST_S2_DEFAULT_MEM_PTE |		\
+	FIELD_PREP(KVM_PTE_LEAF_ATTR_HI_S2_XN, KVM_PTE_LEAF_ATTR_HI_S2_XN_XN))
 
 #define PAGE_HYP		KVM_PGTABLE_PROT_RW
 #define PAGE_HYP_EXEC		(KVM_PGTABLE_PROT_R | KVM_PGTABLE_PROT_X)
@@ -475,6 +501,21 @@ int kvm_pgtable_stage2_annotate(struct kvm_pgtable *pgt, u64 addr, u64 size,
  * Return: 0 on success, negative error code on failure.
  */
 int kvm_pgtable_stage2_unmap(struct kvm_pgtable *pgt, u64 addr, u64 size);
+
+/**
+ * kvm_pgtable_stage2_reclaim_leaves() - Attempt to reclaim leaf page-table
+ *					 pages by coalescing table entries into
+ *					 block mappings.
+ * @pgt:	Page-table structure initialised by kvm_pgtable_stage2_init*().
+ * @addr:	Intermediate physical address from which to reclaim leaves.
+ * @size:	Size of the range.
+ *
+ * The offset of @addr within a page is ignored and @size is rounded-up to
+ * the next page boundary.
+ *
+ * Return: 0 on success, negative error code on failure.
+ */
+int kvm_pgtable_stage2_reclaim_leaves(struct kvm_pgtable *pgt, u64 addr, u64 size);
 
 /**
  * kvm_pgtable_stage2_wrprotect() - Write-protect guest stage-2 address range

@@ -48,13 +48,12 @@ int fscrypt_policy_to_key_spec(const union fscrypt_policy *policy,
 		       FSCRYPT_KEY_IDENTIFIER_SIZE);
 		return 0;
 	default:
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 		return -EINVAL;
 	}
 }
 
-static const union fscrypt_policy *
-fscrypt_get_dummy_policy(struct super_block *sb)
+const union fscrypt_policy *fscrypt_get_dummy_policy(struct super_block *sb)
 {
 	if (!sb->s_cop->get_dummy_policy)
 		return NULL;
@@ -464,7 +463,7 @@ static int set_encryption_policy(struct inode *inode,
 				     current->comm, current->pid);
 		break;
 	default:
-		WARN_ON(1);
+		WARN_ON_ONCE(1);
 		return -EINVAL;
 	}
 

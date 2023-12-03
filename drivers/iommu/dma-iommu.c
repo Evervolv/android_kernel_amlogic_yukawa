@@ -23,6 +23,7 @@
 #include <linux/memremap.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/of_iommu.h>
 #include <linux/pci.h>
 #include <linux/scatterlist.h>
 #include <linux/spinlock.h>
@@ -392,6 +393,8 @@ void iommu_dma_get_resv_regions(struct device *dev, struct list_head *list)
 	if (!is_of_node(dev_iommu_fwspec_get(dev)->iommu_fwnode))
 		iort_iommu_get_resv_regions(dev, list);
 
+	if (dev->of_node)
+		of_iommu_get_resv_regions(dev, list);
 }
 EXPORT_SYMBOL(iommu_dma_get_resv_regions);
 
@@ -613,6 +616,10 @@ static int dma_info_to_prot(enum dma_data_direction dir, bool coherent,
 
 	if (attrs & DMA_ATTR_PRIVILEGED)
 		prot |= IOMMU_PRIV;
+	if (attrs & DMA_ATTR_SYS_CACHE)
+		prot |= IOMMU_SYS_CACHE;
+	if (attrs & DMA_ATTR_SYS_CACHE_NWA)
+		prot |= IOMMU_SYS_CACHE_NWA;
 
 	switch (dir) {
 	case DMA_BIDIRECTIONAL:
@@ -772,6 +779,7 @@ static struct page **__iommu_dma_alloc_pages(struct device *dev,
 			order_size = 1U << order;
 			if (order_mask > order_size)
 				alloc_flags |= __GFP_NORETRY;
+			trace_android_vh_adjust_alloc_flags(order, &alloc_flags);
 			page = alloc_pages_node(nid, alloc_flags, order);
 			if (!page)
 				continue;

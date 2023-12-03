@@ -19,6 +19,7 @@
 #include <linux/kernel.h>
 #include <linux/regmap.h>
 #include <linux/log2.h>
+#include <linux/android_kabi.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
 #include <sound/compress_driver.h>
@@ -762,6 +763,8 @@ struct snd_soc_dai_link {
 #ifdef CONFIG_SND_SOC_TOPOLOGY
 	struct snd_soc_dobj dobj; /* For topology */
 #endif
+
+	ANDROID_KABI_RESERVE(1);
 };
 
 static inline struct snd_soc_dai_link_component*
@@ -1030,6 +1033,11 @@ struct snd_soc_card {
 	unsigned int component_chaining:1;
 
 	void *drvdata;
+
+	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_RESERVE(2);
+	ANDROID_KABI_RESERVE(3);
+	ANDROID_KABI_RESERVE(4);
 };
 #define for_each_card_prelinks(card, i, link)				\
 	for ((i) = 0;							\
@@ -1110,6 +1118,9 @@ struct snd_soc_pcm_runtime {
 	unsigned int fe_compr:1; /* for Dynamic PCM */
 
 	int num_components;
+
+	ANDROID_KABI_RESERVE(1);
+
 	struct snd_soc_component *components[]; /* CPU/Codec/Platform */
 };
 /* see soc_new_pcm_runtime()  */
@@ -1149,6 +1160,8 @@ struct soc_mixer_control {
 #ifdef CONFIG_SND_SOC_TOPOLOGY
 	struct snd_soc_dobj dobj;
 #endif
+
+	ANDROID_KABI_RESERVE(1);
 };
 
 struct soc_bytes {
@@ -1193,6 +1206,8 @@ struct soc_enum {
 #ifdef CONFIG_SND_SOC_TOPOLOGY
 	struct snd_soc_dobj dobj;
 #endif
+
+	ANDROID_KABI_RESERVE(1);
 };
 
 static inline bool snd_soc_volsw_is_stereo(struct soc_mixer_control *mc)
@@ -1369,16 +1384,111 @@ extern struct dentry *snd_soc_debugfs_root;
 
 extern const struct dev_pm_ops snd_soc_pm_ops;
 
-/* Helper functions */
-static inline void snd_soc_dapm_mutex_lock(struct snd_soc_dapm_context *dapm)
+/*
+ *	DAPM helper functions
+ */
+enum snd_soc_dapm_subclass {
+	SND_SOC_DAPM_CLASS_ROOT		= 0,
+	SND_SOC_DAPM_CLASS_RUNTIME	= 1,
+};
+
+static inline void _snd_soc_dapm_mutex_lock_root_c(struct snd_soc_card *card)
 {
-	mutex_lock_nested(&dapm->card->dapm_mutex, SND_SOC_DAPM_CLASS_RUNTIME);
+	mutex_lock_nested(&card->dapm_mutex, SND_SOC_DAPM_CLASS_ROOT);
 }
 
-static inline void snd_soc_dapm_mutex_unlock(struct snd_soc_dapm_context *dapm)
+static inline void _snd_soc_dapm_mutex_lock_c(struct snd_soc_card *card)
 {
-	mutex_unlock(&dapm->card->dapm_mutex);
+	mutex_lock_nested(&card->dapm_mutex, SND_SOC_DAPM_CLASS_RUNTIME);
 }
+
+static inline void _snd_soc_dapm_mutex_unlock_c(struct snd_soc_card *card)
+{
+	mutex_unlock(&card->dapm_mutex);
+}
+
+static inline void _snd_soc_dapm_mutex_assert_held_c(struct snd_soc_card *card)
+{
+	lockdep_assert_held(&card->dapm_mutex);
+}
+
+static inline void _snd_soc_dapm_mutex_lock_root_d(struct snd_soc_dapm_context *dapm)
+{
+	_snd_soc_dapm_mutex_lock_root_c(dapm->card);
+}
+
+static inline void _snd_soc_dapm_mutex_lock_d(struct snd_soc_dapm_context *dapm)
+{
+	_snd_soc_dapm_mutex_lock_c(dapm->card);
+}
+
+static inline void _snd_soc_dapm_mutex_unlock_d(struct snd_soc_dapm_context *dapm)
+{
+	_snd_soc_dapm_mutex_unlock_c(dapm->card);
+}
+
+static inline void _snd_soc_dapm_mutex_assert_held_d(struct snd_soc_dapm_context *dapm)
+{
+	_snd_soc_dapm_mutex_assert_held_c(dapm->card);
+}
+
+#define snd_soc_dapm_mutex_lock_root(x) _Generic((x),			\
+	struct snd_soc_card * :		_snd_soc_dapm_mutex_lock_root_c, \
+	struct snd_soc_dapm_context * :	_snd_soc_dapm_mutex_lock_root_d)(x)
+#define snd_soc_dapm_mutex_lock(x) _Generic((x),			\
+	struct snd_soc_card * :		_snd_soc_dapm_mutex_lock_c,	\
+	struct snd_soc_dapm_context * :	_snd_soc_dapm_mutex_lock_d)(x)
+#define snd_soc_dapm_mutex_unlock(x) _Generic((x),			\
+	struct snd_soc_card * :		_snd_soc_dapm_mutex_unlock_c,	\
+	struct snd_soc_dapm_context * :	_snd_soc_dapm_mutex_unlock_d)(x)
+#define snd_soc_dapm_mutex_assert_held(x) _Generic((x),			\
+	struct snd_soc_card * :		_snd_soc_dapm_mutex_assert_held_c, \
+	struct snd_soc_dapm_context * :	_snd_soc_dapm_mutex_assert_held_d)(x)
+
+/*
+ *	PCM helper functions
+ */
+static inline void _snd_soc_dpcm_mutex_lock_c(struct snd_soc_card *card)
+{
+	mutex_lock_nested(&card->pcm_mutex, card->pcm_subclass);
+}
+
+static inline void _snd_soc_dpcm_mutex_unlock_c(struct snd_soc_card *card)
+{
+	mutex_unlock(&card->pcm_mutex);
+}
+
+static inline void _snd_soc_dpcm_mutex_assert_held_c(struct snd_soc_card *card)
+{
+	lockdep_assert_held(&card->pcm_mutex);
+}
+
+static inline void _snd_soc_dpcm_mutex_lock_r(struct snd_soc_pcm_runtime *rtd)
+{
+	_snd_soc_dpcm_mutex_lock_c(rtd->card);
+}
+
+static inline void _snd_soc_dpcm_mutex_unlock_r(struct snd_soc_pcm_runtime *rtd)
+{
+	_snd_soc_dpcm_mutex_unlock_c(rtd->card);
+}
+
+static inline void _snd_soc_dpcm_mutex_assert_held_r(struct snd_soc_pcm_runtime *rtd)
+{
+	_snd_soc_dpcm_mutex_assert_held_c(rtd->card);
+}
+
+#define snd_soc_dpcm_mutex_lock(x) _Generic((x),			\
+	 struct snd_soc_card * :	_snd_soc_dpcm_mutex_lock_c,	\
+	 struct snd_soc_pcm_runtime * :	_snd_soc_dpcm_mutex_lock_r)(x)
+
+#define snd_soc_dpcm_mutex_unlock(x) _Generic((x),			\
+	 struct snd_soc_card * :	_snd_soc_dpcm_mutex_unlock_c,	\
+	 struct snd_soc_pcm_runtime * :	_snd_soc_dpcm_mutex_unlock_r)(x)
+
+#define snd_soc_dpcm_mutex_assert_held(x) _Generic((x),		\
+	struct snd_soc_card * :		_snd_soc_dpcm_mutex_assert_held_c, \
+	struct snd_soc_pcm_runtime * :	_snd_soc_dpcm_mutex_assert_held_r)(x)
 
 #include <sound/soc-component.h>
 #include <sound/soc-card.h>

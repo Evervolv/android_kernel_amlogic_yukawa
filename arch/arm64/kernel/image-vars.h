@@ -113,9 +113,17 @@ KVM_NVHE_ALIAS(__hyp_data_start);
 KVM_NVHE_ALIAS(__hyp_data_end);
 KVM_NVHE_ALIAS(__hyp_rodata_start);
 KVM_NVHE_ALIAS(__hyp_rodata_end);
+#ifdef CONFIG_TRACING
+KVM_NVHE_ALIAS(__hyp_event_ids_start);
+KVM_NVHE_ALIAS(__hyp_event_ids_end);
+#endif
 
 /* pKVM static key */
 KVM_NVHE_ALIAS(kvm_protected_mode_initialized);
+
+#ifdef CONFIG_ANDROID_ARM64_WORKAROUND_DMA_BEYOND_POC
+KVM_NVHE_ALIAS(pkvm_force_nc);
+#endif
 
 #endif /* CONFIG_KVM */
 

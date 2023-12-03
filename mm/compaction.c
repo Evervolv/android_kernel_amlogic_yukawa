@@ -49,6 +49,9 @@ static inline void count_compact_events(enum vm_event_item item, long delta)
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/compaction.h>
+#undef CREATE_TRACE_POINTS
+#include <trace/hooks/compaction.h>
+#include <trace/hooks/mm.h>
 
 #define block_start_pfn(pfn, order)	round_down(pfn, 1UL << (order))
 #define block_end_pfn(pfn, order)	ALIGN((pfn) + 1, 1UL << (order))
@@ -1369,7 +1372,7 @@ move_freelist_tail(struct list_head *freelist, struct page *freepage)
 }
 
 static void
-fast_isolate_around(struct compact_control *cc, unsigned long pfn, unsigned long nr_isolated)
+fast_isolate_around(struct compact_control *cc, unsigned long pfn)
 {
 	unsigned long start_pfn, end_pfn;
 	struct page *page;
@@ -1390,21 +1393,13 @@ fast_isolate_around(struct compact_control *cc, unsigned long pfn, unsigned long
 	if (!page)
 		return;
 
-	/* Scan before */
-	if (start_pfn != pfn) {
-		isolate_freepages_block(cc, &start_pfn, pfn, &cc->freepages, 1, false);
-		if (cc->nr_freepages >= cc->nr_migratepages)
-			return;
-	}
-
-	/* Scan after */
-	start_pfn = pfn + nr_isolated;
-	if (start_pfn < end_pfn)
-		isolate_freepages_block(cc, &start_pfn, end_pfn, &cc->freepages, 1, false);
+	isolate_freepages_block(cc, &start_pfn, end_pfn, &cc->freepages, 1, false);
 
 	/* Skip this pageblock in the future as it's full or nearly full */
 	if (cc->nr_freepages < cc->nr_migratepages)
 		set_pageblock_skip(page);
+
+	return;
 }
 
 /* Search orders in round-robin fashion */
@@ -1581,7 +1576,7 @@ fast_isolate_freepages(struct compact_control *cc)
 		return cc->free_pfn;
 
 	low_pfn = page_to_pfn(page);
-	fast_isolate_around(cc, low_pfn, nr_isolated);
+	fast_isolate_around(cc, low_pfn);
 	return low_pfn;
 }
 
@@ -1872,6 +1867,7 @@ static unsigned long fast_find_migrateblock(struct compact_control *cc)
 					pfn = cc->zone->zone_start_pfn;
 				cc->fast_search_fail = 0;
 				found_block = true;
+				set_pageblock_skip(freepage);
 				break;
 			}
 		}
@@ -2328,6 +2324,7 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
 	const bool sync = cc->mode != MIGRATE_ASYNC;
 	bool update_cached;
 	unsigned int nr_succeeded = 0;
+	long vendor_ret;
 
 	/*
 	 * These counters track activities during zone compaction.  Initialize
@@ -2398,6 +2395,7 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
 		cc->zone->compact_cached_migrate_pfn[0] == cc->zone->compact_cached_migrate_pfn[1];
 
 	trace_mm_compaction_begin(cc, start_pfn, end_pfn, sync);
+	trace_android_vh_mm_compaction_begin(cc, &vendor_ret);
 
 	/* lru_add_drain_all could be expensive with involving other CPUs */
 	lru_add_drain();
@@ -2523,6 +2521,7 @@ out:
 	count_compact_events(COMPACTMIGRATE_SCANNED, cc->total_migrate_scanned);
 	count_compact_events(COMPACTFREE_SCANNED, cc->total_free_scanned);
 
+	trace_android_vh_mm_compaction_end(cc, vendor_ret);
 	trace_mm_compaction_end(cc, start_pfn, end_pfn, sync, ret);
 
 	return ret;
@@ -2662,7 +2661,7 @@ enum compact_result try_to_compact_pages(gfp_t gfp_mask, unsigned int order,
 					|| fatal_signal_pending(current))
 			break;
 	}
-
+	trace_android_vh_compaction_try_to_compact_pages_exit(&rc);
 	return rc;
 }
 
@@ -2909,6 +2908,7 @@ static void kcompactd_do_work(pg_data_t *pgdat)
 		VM_BUG_ON(!list_empty(&cc.freepages));
 		VM_BUG_ON(!list_empty(&cc.migratepages));
 	}
+	trace_android_vh_compaction_exit(pgdat->node_id, cc.order, cc.highest_zoneidx);
 
 	/*
 	 * Regardless of success, we are done until woken up next. But remember

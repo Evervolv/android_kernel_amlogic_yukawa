@@ -28,6 +28,7 @@
 #include <linux/btf.h>
 #include <linux/rcupdate_trace.h>
 #include <linux/static_call.h>
+#include <linux/android_kabi.h>
 
 struct bpf_verifier_env;
 struct bpf_verifier_log;
@@ -162,6 +163,9 @@ struct bpf_map_ops {
 
 	/* bpf_iter info used to open a seq_file */
 	const struct bpf_iter_seq_info *iter_seq_info;
+
+	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_RESERVE(2);
 };
 
 enum {
@@ -266,6 +270,13 @@ static inline bool map_value_has_kptrs(const struct bpf_map *map)
 	return !IS_ERR_OR_NULL(map->kptr_off_tab);
 }
 
+/* 'dst' must be a temporary buffer and should not point to memory that is being
+ * used in parallel by a bpf program or bpf syscall, otherwise the access from
+ * the bpf program or bpf syscall may be corrupted by the reinitialization,
+ * leading to weird problems. Even 'dst' is newly-allocated from bpf memory
+ * allocator, it is still possible for 'dst' to be used in parallel by a bpf
+ * program or bpf syscall.
+ */
 static inline void check_and_init_map_value(struct bpf_map *map, void *dst)
 {
 	if (unlikely(map_value_has_spin_lock(map)))
@@ -294,7 +305,7 @@ static inline void bpf_long_memcpy(void *dst, const void *src, u32 size)
 
 	size /= sizeof(long);
 	while (size--)
-		*ldst++ = *lsrc++;
+		data_race(*ldst++ = *lsrc++);
 }
 
 /* copy everything but bpf_spin_lock, bpf_timer, and kptrs. There could be one of each. */
@@ -365,6 +376,8 @@ struct bpf_map_dev_ops {
 	int (*map_update_elem)(struct bpf_offloaded_map *map,
 			       void *key, void *value, u64 flags);
 	int (*map_delete_elem)(struct bpf_offloaded_map *map, void *key);
+
+	ANDROID_KABI_RESERVE(1);
 };
 
 struct bpf_offloaded_map {
@@ -731,6 +744,7 @@ struct bpf_verifier_ops {
 				 const struct btf_type *t, int off, int size,
 				 enum bpf_access_type atype,
 				 u32 *next_btf_id, enum bpf_type_flag *flag);
+	ANDROID_KABI_RESERVE(1);
 };
 
 struct bpf_prog_offload_ops {
@@ -746,6 +760,7 @@ struct bpf_prog_offload_ops {
 	int (*prepare)(struct bpf_prog *prog);
 	int (*translate)(struct bpf_prog *prog);
 	void (*destroy)(struct bpf_prog *prog);
+	ANDROID_KABI_RESERVE(1);
 };
 
 struct bpf_prog_offload {
@@ -758,6 +773,7 @@ struct bpf_prog_offload {
 	bool			opt_failed;
 	void			*jited_image;
 	u32			jited_len;
+	ANDROID_KABI_RESERVE(1);
 };
 
 enum bpf_cgroup_storage_type {
@@ -855,22 +871,18 @@ int arch_prepare_bpf_trampoline(struct bpf_tramp_image *tr, void *image, void *i
 				const struct btf_func_model *m, u32 flags,
 				struct bpf_tramp_links *tlinks,
 				void *orig_call);
-/* these two functions are called from generated trampoline */
-u64 notrace __bpf_prog_enter(struct bpf_prog *prog, struct bpf_tramp_run_ctx *run_ctx);
-void notrace __bpf_prog_exit(struct bpf_prog *prog, u64 start, struct bpf_tramp_run_ctx *run_ctx);
-u64 notrace __bpf_prog_enter_sleepable(struct bpf_prog *prog, struct bpf_tramp_run_ctx *run_ctx);
-void notrace __bpf_prog_exit_sleepable(struct bpf_prog *prog, u64 start,
-				       struct bpf_tramp_run_ctx *run_ctx);
-u64 notrace __bpf_prog_enter_lsm_cgroup(struct bpf_prog *prog,
-					struct bpf_tramp_run_ctx *run_ctx);
-void notrace __bpf_prog_exit_lsm_cgroup(struct bpf_prog *prog, u64 start,
-					struct bpf_tramp_run_ctx *run_ctx);
-u64 notrace __bpf_prog_enter_struct_ops(struct bpf_prog *prog,
-					struct bpf_tramp_run_ctx *run_ctx);
-void notrace __bpf_prog_exit_struct_ops(struct bpf_prog *prog, u64 start,
-					struct bpf_tramp_run_ctx *run_ctx);
+u64 notrace __bpf_prog_enter_sleepable_recur(struct bpf_prog *prog,
+					     struct bpf_tramp_run_ctx *run_ctx);
+void notrace __bpf_prog_exit_sleepable_recur(struct bpf_prog *prog, u64 start,
+					     struct bpf_tramp_run_ctx *run_ctx);
 void notrace __bpf_tramp_enter(struct bpf_tramp_image *tr);
 void notrace __bpf_tramp_exit(struct bpf_tramp_image *tr);
+typedef u64 (*bpf_trampoline_enter_t)(struct bpf_prog *prog,
+				      struct bpf_tramp_run_ctx *run_ctx);
+typedef void (*bpf_trampoline_exit_t)(struct bpf_prog *prog, u64 start,
+				      struct bpf_tramp_run_ctx *run_ctx);
+bpf_trampoline_enter_t bpf_trampoline_enter(const struct bpf_prog *prog);
+bpf_trampoline_exit_t bpf_trampoline_exit(const struct bpf_prog *prog);
 
 struct bpf_ksym {
 	unsigned long		 start;
@@ -928,6 +940,7 @@ struct bpf_trampoline {
 	struct bpf_tramp_image *cur_image;
 	u64 selector;
 	struct module *mod;
+	ANDROID_KABI_RESERVE(1);
 };
 
 struct bpf_attach_target_info {
@@ -958,6 +971,7 @@ struct bpf_dispatcher {
 	struct static_call_key *sc_key;
 	void *sc_tramp;
 #endif
+	ANDROID_KABI_RESERVE(1);
 };
 
 static __always_inline __nocfi unsigned int bpf_dispatcher_nop_func(
@@ -1063,7 +1077,7 @@ static inline int bpf_trampoline_unlink_prog(struct bpf_tramp_link *link,
 static inline struct bpf_trampoline *bpf_trampoline_get(u64 key,
 							struct bpf_attach_target_info *tgt_info)
 {
-	return ERR_PTR(-EOPNOTSUPP);
+	return NULL;
 }
 static inline void bpf_trampoline_put(struct bpf_trampoline *tr) {}
 #define DEFINE_BPF_DISPATCHER(name)
@@ -1210,6 +1224,7 @@ struct bpf_prog_aux {
 		struct work_struct work;
 		struct rcu_head	rcu;
 	};
+	ANDROID_KABI_RESERVE(1);
 };
 
 struct bpf_prog {
@@ -1239,6 +1254,7 @@ struct bpf_prog {
 					    const struct bpf_insn *insn);
 	struct bpf_prog_aux	*aux;		/* Auxiliary fields */
 	struct sock_fprog_kern	*orig_prog;	/* Original BPF program */
+	ANDROID_KABI_RESERVE(1);
 	/* Instructions for interpreter */
 	union {
 		DECLARE_FLEX_ARRAY(struct sock_filter, insns);
@@ -1272,6 +1288,7 @@ struct bpf_link_ops {
 	void (*show_fdinfo)(const struct bpf_link *link, struct seq_file *seq);
 	int (*fill_link_info)(const struct bpf_link *link,
 			      struct bpf_link_info *info);
+	ANDROID_KABI_RESERVE(1);
 };
 
 struct bpf_tramp_link {
@@ -1319,6 +1336,7 @@ struct bpf_struct_ops {
 	struct btf_func_model func_models[BPF_STRUCT_OPS_MAX_NR_MEMBERS];
 	u32 type_id;
 	u32 value_id;
+	ANDROID_KABI_RESERVE(1);
 };
 
 #if defined(CONFIG_BPF_JIT) && defined(CONFIG_BPF_SYSCALL)

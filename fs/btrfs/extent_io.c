@@ -13,6 +13,7 @@
 #include <linux/writeback.h>
 #include <linux/pagevec.h>
 #include <linux/prefetch.h>
+#include <linux/cleancache.h>
 #include <linux/fsverity.h>
 #include "misc.h"
 #include "extent_io.h"
@@ -580,7 +581,16 @@ static int repair_io_failure(struct btrfs_fs_info *fs_info, u64 ino, u64 start,
 				      &map_length, &bioc, mirror_num);
 		if (ret)
 			goto out_counter_dec;
-		BUG_ON(mirror_num != bioc->mirror_num);
+		/*
+		 * This happens when dev-replace is also running, and the
+		 * mirror_num indicates the dev-replace target.
+		 *
+		 * In this case, we don't need to do anything, as the read
+		 * error just means the replace progress hasn't reached our
+		 * read range, and later replace routine would handle it well.
+		 */
+		if (mirror_num != bioc->mirror_num)
+			goto out_counter_dec;
 	}
 
 	sector = bioc->stripes[bioc->mirror_num - 1].physical >> 9;
@@ -1753,6 +1763,15 @@ static int btrfs_do_readpage(struct page *page, struct extent_map **em_cached,
 		btrfs_page_set_error(fs_info, page, start, PAGE_SIZE);
 		unlock_page(page);
 		goto out;
+	}
+
+	if (!PageUptodate(page)) {
+		if (cleancache_get_page(page) == 0) {
+			BUG_ON(blocksize != PAGE_SIZE);
+			unlock_extent(tree, start, end, NULL);
+			unlock_page(page);
+			goto out;
+		}
 	}
 
 	if (page->index == last_byte >> PAGE_SHIFT) {
@@ -3006,11 +3025,12 @@ retry:
 			}
 
 			/*
-			 * the filesystem may choose to bump up nr_to_write.
+			 * The filesystem may choose to bump up nr_to_write.
 			 * We have to make sure to honor the new nr_to_write
-			 * at any time
+			 * at any time.
 			 */
-			nr_to_write_done = wbc->nr_to_write <= 0;
+			nr_to_write_done = (wbc->sync_mode == WB_SYNC_NONE &&
+					    wbc->nr_to_write <= 0);
 		}
 		pagevec_release(&pvec);
 		cond_resched();
@@ -3929,6 +3949,7 @@ int extent_fiemap(struct btrfs_inode *inode, struct fiemap_extent_info *fieinfo,
 	lockend = round_up(start + len, root->fs_info->sectorsize);
 	prev_extent_end = lockstart;
 
+	btrfs_inode_lock(&inode->vfs_inode, BTRFS_ILOCK_SHARED);
 	lock_extent(&inode->io_tree, lockstart, lockend, &cached_state);
 
 	ret = fiemap_find_last_extent_offset(inode, path, &last_extent_end);
@@ -4120,6 +4141,7 @@ check_eof_delalloc:
 
 out_unlock:
 	unlock_extent(&inode->io_tree, lockstart, lockend, &cached_state);
+	btrfs_inode_unlock(&inode->vfs_inode, BTRFS_ILOCK_SHARED);
 out:
 	kfree(backref_cache);
 	btrfs_free_path(path);
@@ -5172,8 +5194,14 @@ void read_extent_buffer(const struct extent_buffer *eb, void *dstv,
 	char *dst = (char *)dstv;
 	unsigned long i = get_eb_page_index(start);
 
-	if (check_eb_range(eb, start, len))
+	if (check_eb_range(eb, start, len)) {
+		/*
+		 * Invalid range hit, reset the memory, so callers won't get
+		 * some random garbage for their uninitialzed memory.
+		 */
+		memset(dstv, 0, len);
 		return;
+	}
 
 	offset = get_eb_offset_in_page(eb, start);
 

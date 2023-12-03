@@ -76,11 +76,6 @@ static u32 kvm_pgd_pages(u32 ia_bits, u32 start_level)
 	return __kvm_pgd_page_idx(&pgt, -1ULL) + 1;
 }
 
-static kvm_pte_t *kvm_pte_follow(kvm_pte_t pte, struct kvm_pgtable_mm_ops *mm_ops)
-{
-	return mm_ops->phys_to_virt(kvm_pte_to_phys(pte));
-}
-
 static void kvm_clear_pte(kvm_pte_t *ptep)
 {
 	WRITE_ONCE(*ptep, 0);
@@ -281,7 +276,8 @@ static int hyp_set_prot_attr(enum kvm_pgtable_prot prot, kvm_pte_t *ptep)
 	kvm_pte_t attr;
 	u32 mtype;
 
-	if (!(prot & KVM_PGTABLE_PROT_R) || (device && nc))
+	if (!(prot & KVM_PGTABLE_PROT_R) || (device && nc) ||
+			(prot & (KVM_PGTABLE_PROT_PXN | KVM_PGTABLE_PROT_UXN)))
 		return -EINVAL;
 
 	if (device)
@@ -544,12 +540,14 @@ u64 kvm_get_vtcr(u64 mmfr0, u64 mmfr1, u32 phys_shift)
 		lvls = 2;
 	vtcr |= VTCR_EL2_LVLS_TO_SL0(lvls);
 
+#ifdef CONFIG_ARM64_HW_AFDBM
 	/*
 	 * Enable the Hardware Access Flag management, unconditionally
 	 * on all CPUs. The features is RES0 on CPUs without the support
 	 * and must be ignored by the CPUs.
 	 */
 	vtcr |= VTCR_EL2_HA;
+#endif /* CONFIG_ARM64_HW_AFDBM */
 
 	/* Set the vmid bits */
 	vtcr |= (get_vmid_bits(mmfr1) == 16) ?
@@ -570,15 +568,14 @@ static bool stage2_has_fwb(struct kvm_pgtable *pgt)
 #define KVM_S2_MEMATTR(pgt, attr) PAGE_S2_MEMATTR(attr, stage2_has_fwb(pgt))
 
 static int stage2_set_prot_attr(struct kvm_pgtable *pgt, enum kvm_pgtable_prot prot,
-				kvm_pte_t *ptep)
+		kvm_pte_t *ptep)
 {
+	u64 exec_type = KVM_PTE_LEAF_ATTR_HI_S2_XN_XN;
 	bool device = prot & KVM_PGTABLE_PROT_DEVICE;
 	u32 sh = KVM_PTE_LEAF_ATTR_LO_S2_SH_IS;
 	bool nc = prot & KVM_PGTABLE_PROT_NC;
+	enum kvm_pgtable_prot exec_prot;
 	kvm_pte_t attr;
-
-	if (device && nc)
-		return -EINVAL;
 
 	if (device)
 		attr = KVM_S2_MEMATTR(pgt, DEVICE_nGnRE);
@@ -587,11 +584,23 @@ static int stage2_set_prot_attr(struct kvm_pgtable *pgt, enum kvm_pgtable_prot p
 	else
 		attr = KVM_S2_MEMATTR(pgt, NORMAL);
 
-	if (!(prot & KVM_PGTABLE_PROT_X))
-		attr |= KVM_PTE_LEAF_ATTR_HI_S2_XN;
-	else if (device)
-		return -EINVAL;
+	exec_prot = prot & (KVM_PGTABLE_PROT_X | KVM_PGTABLE_PROT_PXN | KVM_PGTABLE_PROT_UXN);
+	switch(exec_prot) {
+	case KVM_PGTABLE_PROT_X:
+		goto set_ap;
+	case KVM_PGTABLE_PROT_PXN:
+		exec_type = KVM_PTE_LEAF_ATTR_HI_S2_XN_PXN;
+		break;
+	case KVM_PGTABLE_PROT_UXN:
+		exec_type = KVM_PTE_LEAF_ATTR_HI_S2_XN_UXN;
+		break;
+	default:
+		if (exec_prot)
+			return -EINVAL;
+	}
+	attr |= FIELD_PREP(KVM_PTE_LEAF_ATTR_HI_S2_XN, exec_type);
 
+set_ap:
 	if (prot & KVM_PGTABLE_PROT_R)
 		attr |= KVM_PTE_LEAF_ATTR_LO_S2_S2AP_R;
 
@@ -617,8 +626,21 @@ enum kvm_pgtable_prot kvm_pgtable_stage2_pte_prot(kvm_pte_t pte)
 		prot |= KVM_PGTABLE_PROT_R;
 	if (pte & KVM_PTE_LEAF_ATTR_LO_S2_S2AP_W)
 		prot |= KVM_PGTABLE_PROT_W;
-	if (!(pte & KVM_PTE_LEAF_ATTR_HI_S2_XN))
+	switch(FIELD_GET(KVM_PTE_LEAF_ATTR_HI_S2_XN, pte)) {
+	case 0:
 		prot |= KVM_PGTABLE_PROT_X;
+		break;
+	case KVM_PTE_LEAF_ATTR_HI_S2_XN_PXN:
+		prot |= KVM_PGTABLE_PROT_PXN;
+		break;
+	case KVM_PTE_LEAF_ATTR_HI_S2_XN_UXN:
+		prot |= KVM_PGTABLE_PROT_UXN;
+		break;
+	case KVM_PTE_LEAF_ATTR_HI_S2_XN_XN:
+		break;
+	default:
+		WARN_ON(1);
+	}
 
 	return prot;
 }
@@ -660,7 +682,9 @@ static bool stage2_pte_cacheable(struct kvm_pgtable *pgt, kvm_pte_t pte)
 
 static bool stage2_pte_executable(kvm_pte_t pte)
 {
-	return kvm_pte_valid(pte) && !(pte & KVM_PTE_LEAF_ATTR_HI_S2_XN);
+	kvm_pte_t xn = FIELD_GET(KVM_PTE_LEAF_ATTR_HI_S2_XN, pte);
+
+	return kvm_pte_valid(pte) && xn != KVM_PTE_LEAF_ATTR_HI_S2_XN_XN;
 }
 
 static bool stage2_leaf_mapping_allowed(u64 addr, u64 end, u32 level,
@@ -690,25 +714,26 @@ static int stage2_map_walker_try_leaf(u64 addr, u64 end, u32 level,
 	else
 		new = data->annotation;
 
-	if (pte_ops->pte_is_counted_cb(old, level)) {
-		/*
-		 * Skip updating the PTE if we are trying to recreate the exact
-		 * same mapping or only change the access permissions. Instead,
-		 * the vCPU will exit one more time from guest if still needed
-		 * and then go through the path of relaxing permissions.
-		 */
-		if (!stage2_pte_needs_update(old, new))
-			return -EAGAIN;
+	/*
+	 * Skip updating the PTE if we are trying to recreate the exact
+	 * same mapping or only change the access permissions. Instead,
+	 * the vCPU will exit one more time from guest if still needed
+	 * and then go through the path of relaxing permissions.
+	 */
+	if (!stage2_pte_needs_update(old, new))
+		return -EAGAIN;
 
-		/*
-		 * If we're only changing software bits, then we don't need to
-		 * do anything else/
-		 */
-		if (!((old ^ new) & ~KVM_PTE_LEAF_ATTR_HI_SW))
-			goto out_set_pte;
+	if (pte_ops->pte_is_counted_cb(old, level))
+		mm_ops->put_page(ptep);
 
-		stage2_put_pte(ptep, data->mmu, addr, level, mm_ops);
-	}
+	/*
+	 * If we're only changing software bits, then we don't need to
+	 * do anything else.
+	 */
+	if (!((old ^ new) & ~KVM_PTE_LEAF_ATTR_HI_SW))
+		goto out_set_pte;
+
+	stage2_clear_pte(ptep, data->mmu, addr, level);
 
 	/* Perform CMOs before installation of the guest stage-2 PTE */
 	if (mm_ops->dcache_clean_inval_poc && stage2_pte_cacheable(pgt, new))
@@ -717,10 +742,10 @@ static int stage2_map_walker_try_leaf(u64 addr, u64 end, u32 level,
 	if (mm_ops->icache_inval_pou && stage2_pte_executable(new))
 		mm_ops->icache_inval_pou(kvm_pte_follow(new, mm_ops), granule);
 
+out_set_pte:
 	if (pte_ops->pte_is_counted_cb(new, level))
 		mm_ops->get_page(ptep);
 
-out_set_pte:
 	smp_store_release(ptep, new);
 	if (kvm_phys_is_valid(phys))
 		data->phys += granule;
@@ -785,13 +810,49 @@ static int stage2_map_walk_leaf(u64 addr, u64 end, u32 level, kvm_pte_t *ptep,
 	 * a table. Accesses beyond 'end' that fall within the new table
 	 * will be mapped lazily.
 	 */
-	if (pte_ops->pte_is_counted_cb(pte, level))
+	if (pte_ops->pte_is_counted_cb(pte, level)) {
 		stage2_put_pte(ptep, data->mmu, addr, level, mm_ops);
+	} else {
+		/*
+		 * On non-refcounted PTEs we just clear them out without
+		 * dropping the refcount.
+		 */
+		stage2_clear_pte(ptep, data->mmu, addr, level);
+	}
 
 	kvm_set_table_pte(ptep, childp, mm_ops);
 	mm_ops->get_page(ptep);
 
 	return 0;
+}
+
+static void stage2_coalesce_walk_table_post(u64 addr, u64 end, u32 level,
+					    kvm_pte_t *ptep,
+					    struct stage2_map_data *data)
+{
+	struct kvm_pgtable_mm_ops *mm_ops = data->mm_ops;
+	kvm_pte_t *childp = kvm_pte_follow(*ptep, mm_ops);
+
+	/*
+	 * Decrement the refcount only on the set ownership path to avoid a
+	 * loop situation when the following happens:
+	 *  1. We take a host stage2 fault and we create a small mapping which
+	 *  has default attributes (is not refcounted).
+	 *  2. On the way back we execute the post handler and we zap the
+	 *  table that holds our mapping.
+	 */
+	if (kvm_phys_is_valid(data->phys) ||
+	    !kvm_level_supports_block_mapping(level))
+		return;
+
+	/*
+	 * Free a page that is not referenced anymore and drop the reference
+	 * of the page table page.
+	 */
+	if (mm_ops->page_count(childp) == 1) {
+		stage2_put_pte(ptep, data->mmu, addr, level, mm_ops);
+		mm_ops->put_page(childp);
+	}
 }
 
 static int stage2_map_walk_table_post(u64 addr, u64 end, u32 level,
@@ -802,8 +863,11 @@ static int stage2_map_walk_table_post(u64 addr, u64 end, u32 level,
 	kvm_pte_t *childp;
 	int ret = 0;
 
-	if (!data->anchor)
+	if (!data->anchor) {
+		stage2_coalesce_walk_table_post(addr, end, level, ptep,
+						data);
 		return 0;
+	}
 
 	if (data->anchor == ptep) {
 		childp = data->childp;
@@ -951,7 +1015,10 @@ static int stage2_unmap_walker(u64 addr, u64 end, u32 level, kvm_pte_t *ptep,
 	 * block entry and rely on the remaining portions being faulted
 	 * back lazily.
 	 */
-	stage2_put_pte(ptep, mmu, addr, level, mm_ops);
+	if (pte_ops->pte_is_counted_cb(pte, level))
+		stage2_put_pte(ptep, mmu, addr, level, mm_ops);
+	else
+		stage2_clear_pte(ptep, mmu, addr, level);
 
 	if (need_flush && mm_ops->dcache_clean_inval_poc)
 		mm_ops->dcache_clean_inval_poc(kvm_pte_follow(pte, mm_ops),
@@ -969,6 +1036,30 @@ int kvm_pgtable_stage2_unmap(struct kvm_pgtable *pgt, u64 addr, u64 size)
 		.cb	= stage2_unmap_walker,
 		.arg	= pgt,
 		.flags	= KVM_PGTABLE_WALK_LEAF | KVM_PGTABLE_WALK_TABLE_POST,
+	};
+
+	return kvm_pgtable_walk(pgt, addr, size, &walker);
+}
+
+static int stage2_reclaim_leaf_walker(u64 addr, u64 end, u32 level, kvm_pte_t *ptep,
+				      enum kvm_pgtable_walk_flags flag, void * const arg)
+{
+	stage2_coalesce_walk_table_post(addr, end, level, ptep, arg);
+
+	return 0;
+}
+
+int kvm_pgtable_stage2_reclaim_leaves(struct kvm_pgtable *pgt, u64 addr, u64 size)
+{
+	struct stage2_map_data map_data = {
+		.phys		= KVM_PHYS_INVALID,
+		.mmu		= pgt->mmu,
+		.mm_ops		= pgt->mm_ops,
+	};
+	struct kvm_pgtable_walker walker = {
+		.cb	= stage2_reclaim_leaf_walker,
+		.arg	= &map_data,
+		.flags	= KVM_PGTABLE_WALK_TABLE_POST,
 	};
 
 	return kvm_pgtable_walk(pgt, addr, size, &walker);
@@ -1092,7 +1183,7 @@ int kvm_pgtable_stage2_relax_perms(struct kvm_pgtable *pgt, u64 addr,
 	u32 level;
 	kvm_pte_t set = 0, clr = 0;
 
-	if (prot & KVM_PTE_LEAF_ATTR_HI_SW)
+	if (prot & !KVM_PGTABLE_PROT_RWX)
 		return -EINVAL;
 
 	if (prot & KVM_PGTABLE_PROT_R)

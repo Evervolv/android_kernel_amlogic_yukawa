@@ -56,6 +56,10 @@
 
 #include <trace/events/migrate.h>
 
+#undef CREATE_TRACE_POINTS
+#include <trace/hooks/mm.h>
+#include <trace/hooks/vmscan.h>
+
 #include "internal.h"
 
 int isolate_movable_page(struct page *page, isolate_mode_t mode)
@@ -216,6 +220,8 @@ static bool remove_migration_pte(struct folio *folio,
 			pte = maybe_mkwrite(pte, vma);
 		else if (pte_swp_uffd_wp(*pvmw.pte))
 			pte = pte_mkuffd_wp(pte);
+		else
+			pte = pte_wrprotect(pte);
 
 		if (folio_test_anon(folio) && !is_readable_migration_entry(entry))
 			rmap_flags |= RMAP_EXCLUSIVE;
@@ -551,6 +557,8 @@ void folio_migrate_flags(struct folio *newfolio, struct folio *folio)
 	 */
 	if (folio_test_mappedtodisk(folio))
 		folio_set_mappedtodisk(newfolio);
+
+	trace_android_vh_look_around_migrate_folio(folio, newfolio);
 
 	/* Move dirty on pages not done by folio_migrate_mapping() */
 	if (folio_test_dirty(folio))

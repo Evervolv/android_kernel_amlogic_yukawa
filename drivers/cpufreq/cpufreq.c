@@ -32,6 +32,7 @@
 #include <linux/units.h>
 #include <trace/events/power.h>
 #include <trace/hooks/cpufreq.h>
+#include <trace/hooks/thermal.h>
 
 static LIST_HEAD(cpufreq_policy_list);
 
@@ -454,8 +455,10 @@ void cpufreq_freq_transition_end(struct cpufreq_policy *policy,
 			    policy->cur,
 			    policy->cpuinfo.max_freq);
 
+	spin_lock(&policy->transition_lock);
 	policy->transition_ongoing = false;
 	policy->transition_task = NULL;
+	spin_unlock(&policy->transition_lock);
 
 	wake_up(&policy->transition_wait);
 }
@@ -533,8 +536,10 @@ static unsigned int __resolve_freq(struct cpufreq_policy *policy,
 		unsigned int target_freq, unsigned int relation)
 {
 	unsigned int idx;
+	unsigned int old_target_freq = target_freq;
 
 	target_freq = clamp_val(target_freq, policy->min, policy->max);
+	trace_android_vh_cpufreq_resolve_freq(policy, &target_freq, old_target_freq);
 
 	if (!policy->freq_table)
 		return target_freq;
@@ -1218,6 +1223,7 @@ static struct cpufreq_policy *cpufreq_policy_alloc(unsigned int cpu)
 	if (!zalloc_cpumask_var(&policy->real_cpus, GFP_KERNEL))
 		goto err_free_rcpumask;
 
+	init_completion(&policy->kobj_unregister);
 	ret = kobject_init_and_add(&policy->kobj, &ktype_cpufreq,
 				   cpufreq_global_kobject, "policy%u", cpu);
 	if (ret) {
@@ -1256,7 +1262,6 @@ static struct cpufreq_policy *cpufreq_policy_alloc(unsigned int cpu)
 	init_rwsem(&policy->rwsem);
 	spin_lock_init(&policy->transition_lock);
 	init_waitqueue_head(&policy->transition_wait);
-	init_completion(&policy->kobj_unregister);
 	INIT_WORK(&policy->update, handle_update);
 
 	policy->cpu = cpu;
@@ -1535,8 +1540,10 @@ static int cpufreq_online(unsigned int cpu)
 	if (cpufreq_driver->ready)
 		cpufreq_driver->ready(policy);
 
-	if (cpufreq_thermal_control_enabled(cpufreq_driver))
+	if (cpufreq_thermal_control_enabled(cpufreq_driver)) {
 		policy->cdev = of_cpufreq_cooling_register(policy);
+		trace_android_vh_thermal_register(policy);
+	}
 
 	pr_debug("initialization complete\n");
 
@@ -1621,6 +1628,7 @@ static void __cpufreq_offline(unsigned int cpu, struct cpufreq_policy *policy)
 
 	if (cpufreq_thermal_control_enabled(cpufreq_driver)) {
 		cpufreq_cooling_unregister(policy->cdev);
+		trace_android_vh_thermal_unregister(policy);
 		policy->cdev = NULL;
 	}
 
@@ -1739,7 +1747,7 @@ static unsigned int cpufreq_verify_current_freq(struct cpufreq_policy *policy, b
 		 * MHz. In such cases it is better to avoid getting into
 		 * unnecessary frequency updates.
 		 */
-		if (abs(policy->cur - new_freq) < HZ_PER_MHZ)
+		if (abs(policy->cur - new_freq) < KHZ_PER_MHZ)
 			return policy->cur;
 
 		cpufreq_out_of_sync(policy, new_freq);
@@ -2128,9 +2136,11 @@ unsigned int cpufreq_driver_fast_switch(struct cpufreq_policy *policy,
 					unsigned int target_freq)
 {
 	unsigned int freq;
+	unsigned int old_target_freq = target_freq;
 	int cpu;
 
 	target_freq = clamp_val(target_freq, policy->min, policy->max);
+	trace_android_vh_cpufreq_fast_switch(policy, &target_freq, old_target_freq);
 	freq = cpufreq_driver->fast_switch(policy, target_freq);
 
 	if (!freq)
@@ -2140,6 +2150,7 @@ unsigned int cpufreq_driver_fast_switch(struct cpufreq_policy *policy,
 	arch_set_freq_scale(policy->related_cpus, freq,
 			    policy->cpuinfo.max_freq);
 	cpufreq_stats_record_transition(policy, freq);
+	cpufreq_times_record_transition(policy, freq);
 	trace_android_rvh_cpufreq_transition(policy);
 
 	if (trace_cpu_frequency_enabled()) {
@@ -2287,6 +2298,8 @@ int __cpufreq_driver_target(struct cpufreq_policy *policy,
 		return -ENODEV;
 
 	target_freq = __resolve_freq(policy, target_freq, relation);
+
+	trace_android_vh_cpufreq_target(policy, &target_freq, old_target_freq);
 
 	pr_debug("target for CPU %u: %u kHz, relation %u, requested %u kHz\n",
 		 policy->cpu, target_freq, relation, old_target_freq);

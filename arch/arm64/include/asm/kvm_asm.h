@@ -63,12 +63,16 @@ enum __kvm_host_smccc_func {
 	__KVM_HOST_SMCCC_FUNC___kvm_tlb_flush_vmid_ipa,
 	__KVM_HOST_SMCCC_FUNC___kvm_tlb_flush_vmid,
 	__KVM_HOST_SMCCC_FUNC___kvm_flush_cpu_context,
+	__KVM_HOST_SMCCC_FUNC___pkvm_alloc_module_va,
+	__KVM_HOST_SMCCC_FUNC___pkvm_map_module_page,
+	__KVM_HOST_SMCCC_FUNC___pkvm_unmap_module_page,
+	__KVM_HOST_SMCCC_FUNC___pkvm_init_module,
+	__KVM_HOST_SMCCC_FUNC___pkvm_register_hcall,
 	__KVM_HOST_SMCCC_FUNC___pkvm_prot_finalize,
 
 	/* Hypercalls available after pKVM finalisation */
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_share_hyp,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_unshare_hyp,
-	__KVM_HOST_SMCCC_FUNC___pkvm_host_reclaim_page,
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_map_guest,
 	__KVM_HOST_SMCCC_FUNC___kvm_adjust_pc,
 	__KVM_HOST_SMCCC_FUNC___kvm_vcpu_run,
@@ -77,7 +81,9 @@ enum __kvm_host_smccc_func {
 	__KVM_HOST_SMCCC_FUNC___vgic_v3_restore_vmcr_aprs,
 	__KVM_HOST_SMCCC_FUNC___pkvm_init_vm,
 	__KVM_HOST_SMCCC_FUNC___pkvm_init_vcpu,
-	__KVM_HOST_SMCCC_FUNC___pkvm_teardown_vm,
+	__KVM_HOST_SMCCC_FUNC___pkvm_start_teardown_vm,
+	__KVM_HOST_SMCCC_FUNC___pkvm_finalize_teardown_vm,
+	__KVM_HOST_SMCCC_FUNC___pkvm_reclaim_dying_guest_page,
 	__KVM_HOST_SMCCC_FUNC___pkvm_vcpu_load,
 	__KVM_HOST_SMCCC_FUNC___pkvm_vcpu_put,
 	__KVM_HOST_SMCCC_FUNC___pkvm_vcpu_sync_state,
@@ -85,12 +91,15 @@ enum __kvm_host_smccc_func {
 	__KVM_HOST_SMCCC_FUNC___pkvm_iommu_register,
 	__KVM_HOST_SMCCC_FUNC___pkvm_iommu_pm_notify,
 	__KVM_HOST_SMCCC_FUNC___pkvm_iommu_finalize,
-	__KVM_HOST_SMCCC_FUNC___pkvm_register_hcall,
-	__KVM_HOST_SMCCC_FUNC___pkvm_alloc_module_va,
-	__KVM_HOST_SMCCC_FUNC___pkvm_map_module_page,
-	__KVM_HOST_SMCCC_FUNC___pkvm_unmap_module_page,
-	__KVM_HOST_SMCCC_FUNC___pkvm_init_module,
-	__KVM_HOST_SMCCC_FUNC___pkvm_close_module_registration,
+	__KVM_HOST_SMCCC_FUNC___pkvm_load_tracing,
+	__KVM_HOST_SMCCC_FUNC___pkvm_teardown_tracing,
+	__KVM_HOST_SMCCC_FUNC___pkvm_enable_tracing,
+	__KVM_HOST_SMCCC_FUNC___pkvm_rb_swap_reader_page,
+	__KVM_HOST_SMCCC_FUNC___pkvm_rb_update_footers,
+	__KVM_HOST_SMCCC_FUNC___pkvm_enable_event,
+#ifdef CONFIG_ANDROID_ARM64_WORKAROUND_DMA_BEYOND_POC
+	__KVM_HOST_SMCCC_FUNC___pkvm_host_set_stage2_memattr,
+#endif
 
 	/*
 	 * Start of the dynamically registered hypercalls. Start a bit
@@ -144,6 +153,19 @@ extern void *__nvhe_undefined_symbol;
 #define this_cpu_ptr_hyp_sym(sym)	(&__nvhe_undefined_symbol)
 #define per_cpu_ptr_hyp_sym(sym, cpu)	(&__nvhe_undefined_symbol)
 
+/*
+ * pKVM uses the module_ops struct to expose services to modules but
+ * doesn't allow fine-grained definition of the license for each export,
+ * and doesn't have a way to check the license of the loaded module.
+ * Given that said module may be proprietary, let's seek GPL compliance
+ * by preventing the accidental export of GPL symbols to hyp modules via
+ * pKVM's module_ops struct.
+ */
+#ifdef EXPORT_SYMBOL_GPL
+#undef EXPORT_SYMBOL_GPL
+#endif
+#define EXPORT_SYMBOL_GPL(sym) BUILD_BUG()
+
 #elif defined(__KVM_VHE_HYPERVISOR__)
 
 #define CHOOSE_VHE_SYM(sym)	sym
@@ -193,6 +215,7 @@ struct kvm_nvhe_init_params {
 	unsigned long stack_pa;
 	phys_addr_t pgd_pa;
 	unsigned long hcr_el2;
+	unsigned long hfgwtr_el2;
 	unsigned long vttbr;
 	unsigned long vtcr;
 };
@@ -235,6 +258,8 @@ DECLARE_KVM_HYP_SYM(__kvm_hyp_vector);
 extern unsigned long kvm_nvhe_sym(kvm_arm_hyp_percpu_base)[];
 DECLARE_KVM_NVHE_SYM(__per_cpu_start);
 DECLARE_KVM_NVHE_SYM(__per_cpu_end);
+
+extern unsigned long kvm_nvhe_sym(kvm_arm_hyp_host_fp_state)[];
 
 DECLARE_KVM_HYP_SYM(__bp_harden_hyp_vecs);
 #define __bp_harden_hyp_vecs	CHOOSE_HYP_SYM(__bp_harden_hyp_vecs)

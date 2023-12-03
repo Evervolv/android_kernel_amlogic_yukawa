@@ -173,7 +173,7 @@ static void *__vmalloc_user_flags(unsigned long size, gfp_t flags)
 		mmap_write_lock(current->mm);
 		vma = find_vma(current->mm, (unsigned long)ret);
 		if (vma)
-			vma->vm_flags |= VM_USERMAP;
+			vm_flags_set(vma, VM_USERMAP);
 		mmap_write_unlock(current->mm);
 	}
 
@@ -559,7 +559,6 @@ void vma_mas_remove(struct vm_area_struct *vma, struct ma_state *mas)
 
 static void setup_vma_to_mm(struct vm_area_struct *vma, struct mm_struct *mm)
 {
-	mm->map_count++;
 	vma->vm_mm = mm;
 
 	/* add the VMA to the mapping */
@@ -587,6 +586,7 @@ static void mas_add_vma_to_mm(struct ma_state *mas, struct mm_struct *mm,
 	BUG_ON(!vma->vm_region);
 
 	setup_vma_to_mm(vma, mm);
+	mm->map_count++;
 
 	/* add the VMA to the tree */
 	vma_mas_store(vma, mas);
@@ -682,21 +682,18 @@ struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
 EXPORT_SYMBOL(find_vma);
 
 /*
- * find a VMA
- * - we don't extend stack VMAs under NOMMU conditions
- */
-struct vm_area_struct *find_extend_vma(struct mm_struct *mm, unsigned long addr)
-{
-	return find_vma(mm, addr);
-}
-
-/*
  * expand a stack to a given address
  * - not supported under NOMMU conditions
  */
-int expand_stack(struct vm_area_struct *vma, unsigned long address)
+int expand_stack_locked(struct vm_area_struct *vma, unsigned long addr)
 {
 	return -ENOMEM;
+}
+
+struct vm_area_struct *expand_stack(struct mm_struct *mm, unsigned long addr)
+{
+	mmap_read_unlock(mm);
+	return NULL;
 }
 
 /*
@@ -991,7 +988,8 @@ static int do_mmap_private(struct vm_area_struct *vma,
 
 	atomic_long_add(total, &mmap_pages_allocated);
 
-	region->vm_flags = vma->vm_flags |= VM_MAPPED_COPY;
+	vm_flags_set(vma, VM_MAPPED_COPY);
+	region->vm_flags = vma->vm_flags;
 	region->vm_start = (unsigned long) base;
 	region->vm_end   = region->vm_start + len;
 	region->vm_top   = region->vm_start + (total << PAGE_SHIFT);
@@ -1088,7 +1086,7 @@ unsigned long do_mmap(struct file *file,
 	region->vm_flags = vm_flags;
 	region->vm_pgoff = pgoff;
 
-	vma->vm_flags = vm_flags;
+	vm_flags_init(vma, vm_flags);
 	vma->vm_pgoff = pgoff;
 
 	if (file) {
@@ -1152,7 +1150,7 @@ unsigned long do_mmap(struct file *file,
 			vma->vm_end = start + len;
 
 			if (pregion->vm_flags & VM_MAPPED_COPY)
-				vma->vm_flags |= VM_MAPPED_COPY;
+				vm_flags_set(vma, VM_MAPPED_COPY);
 			else {
 				ret = do_mmap_shared_file(vma);
 				if (ret < 0) {
@@ -1240,6 +1238,7 @@ share:
 error_just_free:
 	up_write(&nommu_region_sem);
 error:
+	mas_destroy(&mas);
 	if (region->vm_file)
 		fput(region->vm_file);
 	kmem_cache_free(vm_region_jar, region);
@@ -1250,7 +1249,6 @@ error:
 
 sharing_violation:
 	up_write(&nommu_region_sem);
-	mas_destroy(&mas);
 	pr_warn("Attempt to share mismatched mappings\n");
 	ret = -EINVAL;
 	goto error;
@@ -1347,6 +1345,7 @@ int split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
 	if (vma->vm_file)
 		return -ENOMEM;
 
+	mm = vma->vm_mm;
 	if (mm->map_count >= sysctl_max_map_count)
 		return -ENOMEM;
 
@@ -1398,6 +1397,7 @@ int split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
 	mas_set_range(&mas, vma->vm_start, vma->vm_end - 1);
 	mas_store(&mas, vma);
 	vma_mas_store(new, &mas);
+	mm->map_count++;
 	return 0;
 
 err_mas_preallocate:
@@ -1509,7 +1509,8 @@ int do_munmap(struct mm_struct *mm, unsigned long start, size_t len, struct list
 erase_whole_vma:
 	if (delete_vma_from_mm(vma))
 		ret = -ENOMEM;
-	delete_vma(mm, vma);
+	else
+		delete_vma(mm, vma);
 	return ret;
 }
 
@@ -1632,7 +1633,7 @@ int remap_pfn_range(struct vm_area_struct *vma, unsigned long addr,
 	if (addr != (pfn << PAGE_SHIFT))
 		return -EINVAL;
 
-	vma->vm_flags |= VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP;
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
 	return 0;
 }
 EXPORT_SYMBOL(remap_pfn_range);

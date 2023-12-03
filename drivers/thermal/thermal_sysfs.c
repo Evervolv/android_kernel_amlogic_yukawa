@@ -18,6 +18,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/jiffies.h>
+#include <trace/hooks/thermal.h>
 
 #include "thermal_core.h"
 
@@ -589,13 +590,8 @@ static ssize_t max_state_show(struct device *dev, struct device_attribute *attr,
 			      char *buf)
 {
 	struct thermal_cooling_device *cdev = to_cooling_device(dev);
-	unsigned long state;
-	int ret;
 
-	ret = cdev->ops->get_max_state(cdev, &state);
-	if (ret)
-		return ret;
-	return sprintf(buf, "%ld\n", state);
+	return sprintf(buf, "%ld\n", cdev->max_state);
 }
 
 static ssize_t cur_state_show(struct device *dev, struct device_attribute *attr,
@@ -623,6 +619,10 @@ cur_state_store(struct device *dev, struct device_attribute *attr,
 		return -EINVAL;
 
 	if ((long)state < 0)
+		return -EINVAL;
+
+	/* Requested state should be less than max_state + 1 */
+	if (state > cdev->max_state)
 		return -EINVAL;
 
 	mutex_lock(&cdev->lock);
@@ -826,6 +826,12 @@ static void cooling_device_stats_setup(struct thermal_cooling_device *cdev)
 	struct cooling_dev_stats *stats;
 	unsigned long states;
 	int var;
+	bool disable_cdev_stats = false;
+
+	trace_android_vh_disable_thermal_cooling_stats(cdev,
+						&disable_cdev_stats);
+	if (disable_cdev_stats)
+		goto out;
 
 	if (cdev->ops->get_max_state(cdev, &states))
 		goto out;

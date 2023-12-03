@@ -1432,8 +1432,10 @@ static int snd_pcm_do_start(struct snd_pcm_substream *substream,
 static void snd_pcm_undo_start(struct snd_pcm_substream *substream,
 			       snd_pcm_state_t state)
 {
-	if (substream->runtime->trigger_master == substream)
+	if (substream->runtime->trigger_master == substream) {
 		substream->ops->trigger(substream, SNDRV_PCM_TRIGGER_STOP);
+		substream->runtime->stop_operating = true;
+	}
 }
 
 static void snd_pcm_post_start(struct snd_pcm_substream *substream,
@@ -3667,8 +3669,9 @@ static int snd_pcm_mmap_status(struct snd_pcm_substream *substream, struct file 
 		return -EINVAL;
 	area->vm_ops = &snd_pcm_vm_ops_status;
 	area->vm_private_data = substream;
-	area->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
-	area->vm_flags &= ~(VM_WRITE | VM_MAYWRITE);
+	vm_flags_mod(area, VM_DONTEXPAND | VM_DONTDUMP,
+		     VM_WRITE | VM_MAYWRITE);
+
 	return 0;
 }
 
@@ -3704,7 +3707,7 @@ static int snd_pcm_mmap_control(struct snd_pcm_substream *substream, struct file
 		return -EINVAL;
 	area->vm_ops = &snd_pcm_vm_ops_control;
 	area->vm_private_data = substream;
-	area->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+	vm_flags_set(area, VM_DONTEXPAND | VM_DONTDUMP);
 	return 0;
 }
 
@@ -3820,7 +3823,7 @@ static const struct vm_operations_struct snd_pcm_vm_ops_data_fault = {
 int snd_pcm_lib_default_mmap(struct snd_pcm_substream *substream,
 			     struct vm_area_struct *area)
 {
-	area->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+	vm_flags_set(area, VM_DONTEXPAND | VM_DONTDUMP);
 	if (!substream->ops->page &&
 	    !snd_dma_buffer_mmap(snd_pcm_get_dma_buf(substream), area))
 		return 0;
