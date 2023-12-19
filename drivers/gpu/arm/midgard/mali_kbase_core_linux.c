@@ -4298,7 +4298,7 @@ module_init(kbase_driver_init);
 module_exit(kbase_driver_exit);
 
 #endif /* CONFIG_OF */
-
+MODULE_IMPORT_NS(DMA_BUF);
 MODULE_LICENSE("GPL");
 MODULE_VERSION(MALI_RELEASE_NAME " (UK version " \
 		__stringify(BASE_UK_VERSION_MAJOR) "." \
